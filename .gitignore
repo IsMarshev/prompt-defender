@@ -212,3 +212,5 @@ __marimo__/
 **.parquet
 
 **.jsonl.xz
+
+**.json

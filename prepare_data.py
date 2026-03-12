@@ -194,10 +194,9 @@ def parse_toxicchat(path: str) -> list[dict]:
         response = line.get("model_output", "")
         toxic = line.get("toxicity", 0)
         jailbreak = line.get("jailbreaking", 0)
-
-        if jailbreak:
+        if "1" in jailbreak:
             q_safety, q_cat = "unsafe", "Jailbreak"
-        elif toxic:
+        elif int(toxic):
             q_safety, q_cat = "unsafe", "Unethical Acts"
         else:
             q_safety, q_cat = "safe", "None"
@@ -238,9 +237,9 @@ def parse_aegis(path: str) -> list[dict]:
     records = []
     for line in _iter_jsonl(path):
         prompt = line.get("text", line.get("prompt", ""))
-        response = line.get("response", None)
-        label = normalize_safety(line.get("label", "safe"))
-        cat = normalize_category(line.get("category", None))
+        response = line.get("response_label", None)
+        label = normalize_safety(line.get("prompt_label", "safe"))
+        cat = normalize_category(line.get("violated_categories", None))
 
         records.append(make_record(
             prompt=prompt,
