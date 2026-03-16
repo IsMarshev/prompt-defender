@@ -45,11 +45,14 @@ class ResponseLoss(nn.Module):
 
         y_cat = y_cat.masked_fill(y_risk == self.safe_label, -100)
 
-        loss_cat = F.cross_entropy(
-            logits_cat,
-            y_cat,
-            ignore_index=-100,
-            reduction="mean"
-        )
+        if (y_cat != -100).any():
+            loss_cat = F.cross_entropy(
+                logits_cat,
+                y_cat,
+                ignore_index=-100,
+                reduction="mean"
+            )
+        else:
+            loss_cat = torch.tensor(0.0, device=logits_risk.device)
 
         return loss_risk + loss_cat
