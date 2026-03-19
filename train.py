@@ -1,5 +1,5 @@
 """
-Stream Qwen3Guard training with PyTorch Lightning.
+Stream Qwen3Guard-Gen training with PyTorch Lightning.
 
 Single GPU:
     python train.py --config config.yaml
@@ -23,8 +23,7 @@ from lightning.pytorch.strategies import DDPStrategy
 from torch.optim import AdamW, Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
 
-from model import StreamGuard
-from loss import QueryLoss, ResponseLoss
+from model import PromptGuardGenModel
 from dataset import build_dataloader
 
 
@@ -34,65 +33,51 @@ class StreamGuardModule(L.LightningModule):
         self.save_hyperparameters(cfg)
         self.cfg = cfg
 
-        self.model = StreamGuard(
-            backbone_name=cfg["model"]["backbone"],
+        self.model = PromptGuardGenModel(
+            model_name=cfg["model"]["backbone"],
             freeze_backbone=cfg["model"]["freeze_backbone"],
         )
-        self.query_loss_fn = QueryLoss()
-        self.response_loss_fn = ResponseLoss()
 
     def forward(self, batch):
         return self.model(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
-            query_end_idx=batch["query_end_idx"],
+            labels=batch["labels"],
         )
 
     def _shared_step(self, batch):
-        q_risk, q_cat, r_risk, r_cat = self(batch)
+        output = self(batch)
+        loss = output.loss
 
-        loss_q = self.query_loss_fn(
-            y_risk=batch["q_risk"],
-            y_cat=batch["q_cat"],
-            logits_risk=q_risk,
-            logits_cat=q_cat,
-        )
-        loss_r = self.response_loss_fn(
-            y_risk=batch["r_risk"],
-            y_cat=batch["r_cat"],
-            logits_risk=r_risk,
-            logits_cat=r_cat,
-        )
-        loss = loss_q + loss_r
-
-        # --- metrics ---
+        # Token-level accuracy on target tokens (where labels != -100)
         with torch.no_grad():
-            q_risk_acc = (q_risk.argmax(-1) == batch["q_risk"]).float().mean()
-            r_risk_pred = r_risk.argmax(-1)
-            mask = batch["attention_mask"].bool()
-            r_risk_acc = (r_risk_pred[mask] == batch["r_risk"][mask]).float().mean()
+            preds = output.logits[:, :-1].argmax(dim=-1)
+            target = batch["labels"][:, 1:]
+            mask = target != -100
+            if mask.any():
+                acc = (preds[mask] == target[mask]).float().mean()
+            else:
+                acc = torch.tensor(0.0, device=loss.device)
 
-        return loss, loss_q, loss_r, q_risk_acc, r_risk_acc
+        return loss, acc
 
     def training_step(self, batch, batch_idx):
-        loss, loss_q, loss_r, q_acc, r_acc = self._shared_step(batch)
+        loss, acc = self._shared_step(batch)
 
         self.log("train/loss", loss, prog_bar=True, sync_dist=True)
-        self.log("train/loss_query", loss_q, sync_dist=True)
-        self.log("train/loss_response", loss_r, sync_dist=True)
-        self.log("train/q_risk_acc", q_acc, prog_bar=True, sync_dist=True)
-        self.log("train/r_risk_acc", r_acc, sync_dist=True)
+        self.log("train_loss", loss, prog_bar=False, sync_dist=True)
+        self.log("train/token_acc", acc, prog_bar=True, sync_dist=True)
+        self.log("train_token_acc", acc, prog_bar=False, sync_dist=True)
 
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, loss_q, loss_r, q_acc, r_acc = self._shared_step(batch)
+        loss, acc = self._shared_step(batch)
 
         self.log("val/loss", loss, prog_bar=True, sync_dist=True)
-        self.log("val/loss_query", loss_q, sync_dist=True)
-        self.log("val/loss_response", loss_r, sync_dist=True)
-        self.log("val/q_risk_acc", q_acc, prog_bar=True, sync_dist=True)
-        self.log("val/r_risk_acc", r_acc, sync_dist=True)
+        self.log("val_loss", loss, prog_bar=False, sync_dist=True)
+        self.log("val/token_acc", acc, prog_bar=True, sync_dist=True)
+        self.log("val_token_acc", acc, prog_bar=False, sync_dist=True)
 
     def configure_optimizers(self):
         cfg_opt = self.cfg["optimizer"]
@@ -100,28 +85,49 @@ class StreamGuardModule(L.LightningModule):
         cfg_sched = self.cfg["scheduler"]
 
         OptClass = AdamW if cfg_opt["name"] == "adamw" else Adam
+        parameters = [p for p in self.parameters() if p.requires_grad]
+        if not parameters:
+            raise ValueError(
+                "No trainable parameters found. "
+                "Set model.freeze_backbone=false or add trainable adapters."
+            )
         optimizer = OptClass(
-            self.parameters(),
+            parameters,
             lr=cfg_train["learning_rate"],
             weight_decay=cfg_train["weight_decay"],
             betas=tuple(cfg_opt["betas"]),
             eps=cfg_opt["eps"],
         )
 
-        total_steps = self.trainer.estimated_stepping_batches
+        total_steps = max(int(self.trainer.estimated_stepping_batches), 1)
         warmup_steps = int(total_steps * cfg_train["warmup_ratio"])
+        warmup_steps = min(warmup_steps, max(total_steps - 1, 0))
+        decay_steps = max(total_steps - warmup_steps, 1)
 
         if cfg_sched["name"] == "cosine":
-            scheduler = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
+            scheduler = CosineAnnealingLR(optimizer, T_max=decay_steps)
         else:
-            scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=total_steps - warmup_steps)
+            scheduler = LinearLR(
+                optimizer,
+                start_factor=1.0,
+                end_factor=0.0,
+                total_iters=decay_steps,
+            )
 
-        warmup = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
-        combined = torch.optim.lr_scheduler.SequentialLR(
-            optimizer,
-            schedulers=[warmup, scheduler],
-            milestones=[warmup_steps],
-        )
+        if warmup_steps > 0:
+            warmup = LinearLR(
+                optimizer,
+                start_factor=0.01,
+                end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+            combined = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup, scheduler],
+                milestones=[warmup_steps],
+            )
+        else:
+            combined = scheduler
 
         return {
             "optimizer": optimizer,
@@ -156,6 +162,7 @@ def main():
         max_length=cfg["data"]["max_length"],
         shuffle=True,
         num_workers=cfg["output"]["num_workers"],
+        include_response_tasks=cfg["data"].get("include_response_tasks", True),
     )
     val_dl = build_dataloader(
         data_path=cfg["data"]["val_path"],
@@ -164,6 +171,7 @@ def main():
         max_length=cfg["data"]["max_length"],
         shuffle=False,
         num_workers=cfg["output"]["num_workers"],
+        include_response_tasks=cfg["data"].get("include_response_tasks", True),
     )
 
     # --- model ---
@@ -174,11 +182,12 @@ def main():
     callbacks = [
         ModelCheckpoint(
             dirpath=ckpt_dir,
-            filename="guard-{epoch}-{step}-{val/loss:.4f}",
+            filename="guard-{epoch}-{step}-{val_loss:.4f}",
             monitor="val/loss",
             mode="min",
             save_top_k=3,
             every_n_train_steps=cfg["logging"]["save_every"],
+            auto_insert_metric_name=False,
         ),
         LearningRateMonitor(logging_interval="step"),
     ]

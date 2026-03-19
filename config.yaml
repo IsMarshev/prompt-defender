@@ -5,9 +5,10 @@ model:
   freeze_backbone: false            
 
 data:
-  train_path: "datasets/train.jsonl"
-  val_path: "datasets/val.jsonl"
+  train_path: "datasets/train_merged.jsonl"
+  val_path: "datasets/val_merged.jsonl"
   max_length: 2048
+  include_response_tasks: true
 
 training:
   epochs: 3

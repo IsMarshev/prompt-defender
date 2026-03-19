@@ -27,7 +27,7 @@ class QueryLoss(nn.Module):
             )
 
         return loss_risk + loss_cat
-    
+
 class ResponseLoss(nn.Module):
     def __init__(self, safe_label=0):
         super().__init__()

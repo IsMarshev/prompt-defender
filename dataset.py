@@ -1,182 +1,214 @@
 """
-Dataset and DataLoader for Stream Qwen3Guard training.
+Dataset for Qwen3Guard-Gen style generative training.
 
-Expected JSONL format (one JSON object per line):
-{
-    "messages": [
-        {"role": "user", "content": "How to make a bomb?"},
-        {"role": "assistant", "content": "I'm sorry, I can't help with that."}
-    ],
-    "query_safety": "unsafe",          // "safe" | "controversial" | "unsafe"
-    "query_category": "Violent",       // category name or "None"
-    "response_safety": "safe",         // "safe" | "controversial" | "unsafe"
-    "response_category": "None",       // category name or "None"
-    "boundary_token": null             // int | null -- first unsafe token index in response
-}
-
-Token-level label logic (Section 4.2):
-  - All tokens before boundary_token -> safe (risk=0, cat=0)
-  - Tokens from boundary_token onward -> sample-level label
-  - If boundary_token is null and response is unsafe -> entire response is unsafe
+Each JSONL row is converted into one or two instruction-following samples:
+1. Prompt moderation: classify the user-side conversation state.
+2. Response moderation: classify the assistant response, if present.
 """
 
 import json
-from pathlib import Path
+from functools import partial
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer
 
-from model import NUM_QUERY_CAT, NUM_RESPONSE_CAT
 
-RISK_MAP = {"safe": 0, "controversial": 1, "unsafe": 2}
-
-QUERY_CAT_MAP = {
-    "None": 0,
-    "Violent": 1,
-    "Non-violent Illegal Acts": 2,
-    "Sexual Content or Sexual Acts": 3,
-    "PII": 4,
-    "Suicide & Self-Harm": 5,
-    "Unethical Acts": 6,
-    "Politically Sensitive Topics": 7,
-    "Copyright Violation": 8,
-    "Jailbreak": 9,
+RISK_DISPLAY = {
+    "safe": "Safe",
+    "controversial": "Controversial",
+    "unsafe": "Unsafe",
 }
 
-RESPONSE_CAT_MAP = {
-    "None": 0,
-    "Violent": 1,
-    "Non-violent Illegal Acts": 2,
-    "Sexual Content or Sexual Acts": 3,
-    "PII": 4,
-    "Suicide & Self-Harm": 5,
-    "Unethical Acts": 6,
-    "Politically Sensitive Topics": 7,
-    "Copyright Violation": 8,
-}
+REFUSAL_PREFIXES = (
+    "i'm sorry",
+    "i cannot",
+    "i can't",
+    "i wont",
+    "i won't",
+    "sorry",
+    "as a responsible",
+    "i must refuse",
+    "i cannot help",
+    "i can't help",
+)
+
+
+def format_safety(label: str | None) -> str:
+    return RISK_DISPLAY.get((label or "safe").lower(), "Safe")
+
+
+def format_categories(value) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, list):
+        categories = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        raw = str(value).strip()
+        if not raw or raw.lower() == "none":
+            return "None"
+        categories = [part.strip() for part in raw.split(",") if part.strip()]
+    return ", ".join(categories) if categories else "None"
+
+
+def derive_refusal_label(sample: dict, response_text: str | None) -> str:
+    query_safety = (sample.get("query_safety") or "safe").lower()
+    response_safety = (sample.get("response_safety") or "safe").lower()
+
+    if response_text:
+        normalized = response_text.strip().lower()
+        if normalized.startswith(REFUSAL_PREFIXES):
+            return "Yes"
+
+    if query_safety in {"unsafe", "controversial"} and response_safety == "safe":
+        return "Yes"
+    return "No"
+
+
+def build_prompt_target(sample: dict) -> str:
+    return (
+        f"Safety: {format_safety(sample.get('query_safety'))}\n"
+        f"Categories: {format_categories(sample.get('query_category'))}"
+    )
+
+
+def build_response_target(sample: dict, response_text: str | None) -> str:
+    return (
+        f"Safety: {format_safety(sample.get('response_safety'))}\n"
+        f"Categories: {format_categories(sample.get('response_category'))}\n"
+        f"Refusal: {derive_refusal_label(sample, response_text)}"
+    )
+
+
+def trim_messages_for_prompt_moderation(messages: list[dict]) -> list[dict]:
+    if messages and messages[-1].get("role") == "assistant":
+        return messages[:-1]
+    return messages
+
+
+def truncate_pair(prompt_ids: list[int], target_ids: list[int], max_length: int) -> tuple[list[int], list[int]]:
+    if len(target_ids) >= max_length:
+        return [], target_ids[:max_length]
+
+    max_prompt_len = max_length - len(target_ids)
+    if len(prompt_ids) > max_prompt_len:
+        prompt_ids = prompt_ids[-max_prompt_len:]
+
+    return prompt_ids, target_ids
 
 
 class GuardDataset(Dataset):
-    def __init__(self, data_path: str, tokenizer_name: str, max_length: int = 2048):
+    def __init__(
+        self,
+        data_path: str,
+        tokenizer_name: str,
+        max_length: int = 2048,
+        include_response_tasks: bool = True,
+    ):
         self.samples = []
         with open(data_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
-                    self.samples.append(json.loads(line))
+                    sample = json.loads(line)
+                    self.samples.extend(
+                        self._expand_sample(sample, include_response_tasks=include_response_tasks)
+                    )
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_name, trust_remote_code=True
+            tokenizer_name,
+            trust_remote_code=True,
         )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         self.max_length = max_length
+
+    def _expand_sample(self, sample: dict, include_response_tasks: bool) -> list[dict]:
+        messages = sample.get("messages") or []
+        if not messages:
+            return []
+
+        examples = []
+
+        prompt_messages = trim_messages_for_prompt_moderation(messages)
+        if prompt_messages:
+            examples.append(
+                {
+                    "messages": prompt_messages,
+                    "target_text": build_prompt_target(sample),
+                }
+            )
+
+        if include_response_tasks and messages[-1].get("role") == "assistant":
+            response_text = messages[-1].get("content")
+            examples.append(
+                {
+                    "messages": messages,
+                    "target_text": build_response_target(sample, response_text),
+                }
+            )
+
+        return examples
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        messages = sample["messages"]
 
-        # --- Tokenize the full conversation via chat template ---
-        text = self.tokenizer.apply_chat_template(
-            messages,
+        prompt_text = self.tokenizer.apply_chat_template(
+            sample["messages"],
             tokenize=False,
-            add_generation_prompt=False,
-            enable_thinking=False,
         )
-        encoding = self.tokenizer(
-            text,
-            max_length=self.max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-        input_ids = encoding.input_ids.squeeze(0)       # (L,)
-        attention_mask = encoding.attention_mask.squeeze(0)  # (L,)
+        target_text = sample["target_text"] + self.tokenizer.eos_token
 
-        # --- Find query end position (first <|im_end|> token) ---
-        im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-        end_positions = (input_ids == im_end_id).nonzero(as_tuple=True)[0]
-        query_end_idx = end_positions[0].item() if len(end_positions) > 0 else 0
+        prompt_ids = self.tokenizer(
+            prompt_text,
+            add_special_tokens=False,
+            return_attention_mask=False,
+        )["input_ids"]
+        target_ids = self.tokenizer(
+            target_text,
+            add_special_tokens=False,
+            return_attention_mask=False,
+        )["input_ids"]
 
-        # --- Determine where the response tokens start ---
-        # Response tokens begin after the second <|im_start|> block
-        if len(end_positions) >= 1:
-            response_start = query_end_idx + 1
-        else:
-            response_start = len(input_ids)
+        prompt_ids, target_ids = truncate_pair(prompt_ids, target_ids, self.max_length)
 
-        # --- Query-level labels ---
-        q_risk = RISK_MAP[sample["query_safety"]]
-        q_cat = QUERY_CAT_MAP.get(sample.get("query_category", "None"), 0)
-
-        # --- Response token-level labels ---
-        r_safety = RISK_MAP.get(sample.get("response_safety", "safe"), 0)
-        r_cat_id = RESPONSE_CAT_MAP.get(sample.get("response_category", "None"), 0)
-        boundary = sample.get("boundary_token")
-
-        seq_len = len(input_ids)
-        r_risk_labels = torch.zeros(seq_len, dtype=torch.long)
-        r_cat_labels = torch.zeros(seq_len, dtype=torch.long)
-
-        if r_safety != 0:  # not safe
-            if boundary is not None:
-                start = min(response_start + boundary, seq_len)
-            else:
-                start = response_start
-            r_risk_labels[start:] = r_safety
-            r_cat_labels[start:] = r_cat_id
+        input_ids = prompt_ids + target_ids
+        labels = [-100] * len(prompt_ids) + target_ids
+        attention_mask = [1] * len(input_ids)
 
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "query_end_idx": query_end_idx,
-            "q_risk": torch.tensor(q_risk, dtype=torch.long),
-            "q_cat": torch.tensor(q_cat, dtype=torch.long),
-            "r_risk": r_risk_labels,
-            "r_cat": r_cat_labels,
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
         }
 
 
-def collate_fn(batch: list[dict]) -> dict:
-    """Pad sequences to the longest in the batch."""
+def collate_fn(batch: list[dict], pad_token_id: int) -> dict:
     max_len = max(b["input_ids"].size(0) for b in batch)
 
     input_ids = []
     attention_mask = []
-    query_end_idx = []
-    q_risk = []
-    q_cat = []
-    r_risk = []
-    r_cat = []
+    labels = []
 
-    for b in batch:
-        pad_len = max_len - b["input_ids"].size(0)
-
+    for item in batch:
+        pad_len = max_len - item["input_ids"].size(0)
         input_ids.append(
-            torch.nn.functional.pad(b["input_ids"], (0, pad_len), value=0)
+            torch.nn.functional.pad(item["input_ids"], (0, pad_len), value=pad_token_id)
         )
         attention_mask.append(
-            torch.nn.functional.pad(b["attention_mask"], (0, pad_len), value=0)
+            torch.nn.functional.pad(item["attention_mask"], (0, pad_len), value=0)
         )
-        r_risk.append(
-            torch.nn.functional.pad(b["r_risk"], (0, pad_len), value=0)
+        labels.append(
+            torch.nn.functional.pad(item["labels"], (0, pad_len), value=-100)
         )
-        r_cat.append(
-            torch.nn.functional.pad(b["r_cat"], (0, pad_len), value=0)
-        )
-        query_end_idx.append(b["query_end_idx"])
-        q_risk.append(b["q_risk"])
-        q_cat.append(b["q_cat"])
 
     return {
         "input_ids": torch.stack(input_ids),
         "attention_mask": torch.stack(attention_mask),
-        "query_end_idx": torch.tensor(query_end_idx, dtype=torch.long),
-        "q_risk": torch.stack(q_risk),
-        "q_cat": torch.stack(q_cat),
-        "r_risk": torch.stack(r_risk),
-        "r_cat": torch.stack(r_cat),
+        "labels": torch.stack(labels),
     }
 
 
@@ -187,13 +219,19 @@ def build_dataloader(
     max_length: int = 2048,
     shuffle: bool = True,
     num_workers: int = 0,
+    include_response_tasks: bool = True,
 ) -> DataLoader:
-    ds = GuardDataset(data_path, tokenizer_name, max_length)
+    dataset = GuardDataset(
+        data_path=data_path,
+        tokenizer_name=tokenizer_name,
+        max_length=max_length,
+        include_response_tasks=include_response_tasks,
+    )
     return DataLoader(
-        ds,
+        dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        collate_fn=collate_fn,
+        collate_fn=partial(collate_fn, pad_token_id=dataset.tokenizer.pad_token_id),
         num_workers=num_workers,
         pin_memory=True,
     )
