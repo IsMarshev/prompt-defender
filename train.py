@@ -1,5 +1,5 @@
 """
-Stream Qwen3Guard-Gen training with PyTorch Lightning.
+Generative Qwen3Guard training with PyTorch Lightning.
 
 Single GPU:
     python train.py --config config.yaml
@@ -27,7 +27,7 @@ from model import PromptGuardGenModel
 from dataset import build_dataloader
 
 
-class StreamGuardModule(L.LightningModule):
+class GenerativeGuardModule(L.LightningModule):
     def __init__(self, cfg: dict):
         super().__init__()
         self.save_hyperparameters(cfg)
@@ -175,7 +175,7 @@ def main():
     )
 
     # --- model ---
-    module = StreamGuardModule(cfg)
+    module = GenerativeGuardModule(cfg)
 
     # --- callbacks ---
     ckpt_dir = Path(cfg["output"]["dir"])
@@ -217,7 +217,7 @@ def main():
         log_every_n_steps=cfg["logging"]["log_every"],
         val_check_interval=cfg["logging"]["eval_every"],
         callbacks=callbacks,
-        logger=TensorBoardLogger(save_dir=ckpt_dir / "logs", name="stream_guard"),
+        logger=TensorBoardLogger(save_dir=ckpt_dir / "logs", name="generative_guard"),
         enable_progress_bar=True,
     )
 

@@ -1,4 +1,4 @@
-# ── Stream Qwen3Guard Training Config ──
+# ── Generative Qwen3Guard Training Config ──
 
 model:
   backbone: "Qwen/Qwen3-0.6B"     
