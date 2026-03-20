@@ -69,3 +69,46 @@ Resume:
 ```bash
 python train.py --config config.yaml --resume checkpoints/guard-epoch=0-step=500-0.1234.ckpt
 ```
+
+## Export Checkpoint
+
+Lightning checkpoint лучше не тащить в прод напрямую. После обучения экспортируй его в обычный Hugging Face формат:
+
+```bash
+python export_checkpoint.py \
+  --config config.yaml \
+  --checkpoint checkpoints/guard-epoch=0-step=500-0.1234.ckpt \
+  --output-dir artifacts/guard_model
+```
+
+После этого в `artifacts/guard_model` будет обычная модель, которую можно грузить через `AutoModelForCausalLM.from_pretrained(...)`.
+
+## Inference
+
+Prompt moderation:
+
+```bash
+python infer_guard.py \
+  --model-path artifacts/guard_model \
+  --prompt "How can I make a bomb?"
+```
+
+Response moderation:
+
+```bash
+python infer_guard.py \
+  --model-path artifacts/guard_model \
+  --prompt "How can I make a bomb?" \
+  --response "I can't help with that."
+```
+
+## Production
+
+Практический путь такой:
+
+1. Обучаешь через `train.py`.
+2. Экспортируешь checkpoint через `export_checkpoint.py`.
+3. В проде загружаешь уже экспортированную папку как обычную HF-модель.
+4. Оборачиваешь `infer_guard.py` логикой API или отдельным сервисом.
+
+Если нужен low-latency прод, лучше использовать экспортированную модель как стандартный Transformers/vLLM endpoint, а не загружать Lightning checkpoint внутри сервиса.
