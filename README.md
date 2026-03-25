@@ -70,6 +70,30 @@ Resume:
 python train.py --config config.yaml --resume checkpoints/guard-epoch=0-step=500-0.1234.ckpt
 ```
 
+### Validation Speed
+
+Validation is split into two budgets:
+
+- `logging.limit_val_batches`: how many validation batches are used for `val/loss` and `val/token_acc` on each run.
+- `logging.generative_eval_batches`: how many of those batches also run `generate()` for `val/macro_f1` and `val/macro_recall`.
+
+Practical presets:
+
+```yaml
+logging:
+  eval_every: 500
+  limit_val_batches: 128
+  generative_eval_batches: 32
+```
+
+For a full slow validation pass on the whole set:
+
+```yaml
+logging:
+  limit_val_batches: 1.0
+  generative_eval_batches: -1
+```
+
 ## Export Checkpoint
 
 Lightning checkpoint лучше не тащить в прод напрямую. После обучения экспортируй его в обычный Hugging Face формат:
