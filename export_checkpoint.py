@@ -3,14 +3,13 @@ import json
 from pathlib import Path
 
 import torch
-import yaml
 
+from experiment_utils import load_yaml, now_iso, save_json
 from model import PromptGuardGenModel
 
 
 def load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    return load_yaml(path)
 
 
 def extract_model_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -30,6 +29,12 @@ def main():
     parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to .ckpt file")
     parser.add_argument("--output-dir", type=str, required=True, help="Directory for exported model")
+    parser.add_argument(
+        "--summary-file",
+        type=str,
+        default=None,
+        help="Optional path to export summary JSON",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -65,6 +70,20 @@ def main():
     }
     with (output_dir / "export_meta.json").open("w", encoding="utf-8") as f:
         json.dump(export_meta, f, ensure_ascii=False, indent=2)
+
+    export_summary = {
+        "status": "completed",
+        "created_at": now_iso(),
+        "config_path": args.config,
+        "checkpoint": str(checkpoint_path),
+        "output_dir": str(output_dir),
+        "base_model": cfg["model"]["backbone"],
+        "missing_keys": missing,
+        "unexpected_keys": unexpected,
+        "export_meta_file": str(output_dir / "export_meta.json"),
+    }
+    summary_path = Path(args.summary_file) if args.summary_file else output_dir / "export_summary.json"
+    save_json(summary_path, export_summary)
 
     print(f"Exported model to {output_dir}")
 

@@ -10,6 +10,8 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from experiment_utils import now_iso, save_json
+
 
 CANONICAL_LABELS = {
     "safe": "Safe",
@@ -34,6 +36,11 @@ def parse_args() -> argparse.Namespace:
         "--output-file",
         default=None,
         help="Optional JSONL file with per-example predictions",
+    )
+    parser.add_argument(
+        "--metrics-file",
+        default=None,
+        help="Optional JSON file with aggregate evaluation metrics",
     )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=256)
@@ -402,6 +409,21 @@ def main() -> None:
         gold_positive_labels=gold_positive_labels,
         pred_positive_labels=pred_positive_labels,
     )
+
+    if args.metrics_file:
+        save_json(
+            Path(args.metrics_file),
+            {
+                "created_at": now_iso(),
+                "model_path": str(model_path),
+                "data_path": str(data_path),
+                "output_file": args.output_file,
+                "metrics": metrics,
+                "gold_positive_labels": sorted(gold_positive_labels),
+                "pred_positive_labels": sorted(pred_positive_labels),
+                "args": vars(args),
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -19,11 +19,12 @@ import yaml
 import torch
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
-from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
+from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.strategies import DDPStrategy
 from torch.optim import AdamW, Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
 
+from experiment_utils import now_iso, save_json
 from model import PromptGuardGenModel
 from dataset import SAFETY_LABEL_TO_ID, build_dataloader
 
@@ -359,6 +360,14 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def maybe_to_float(value):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().item()
+    return float(value)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config.yaml")
@@ -367,9 +376,15 @@ def main():
     parser.add_argument("--strategy", type=str, default="auto")
     parser.add_argument("--resume", type=str, default=None, help="path to checkpoint")
     parser.add_argument("--logger", type=str, default="tensorboard", choices=["tensorboard", "wandb"], help="Logger to use")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible runs")
+    parser.add_argument("--skip-auto-export", action="store_true", help="Skip automatic best-checkpoint export to HF format")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    seed = args.seed if args.seed is not None else cfg.get("training", {}).get("seed")
+
+    if seed is not None:
+        L.seed_everything(seed, workers=True)
 
     # --- dataloaders ---
     train_dl = build_dataloader(
@@ -396,24 +411,27 @@ def main():
 
     # --- callbacks ---
     ckpt_dir = Path(cfg["output"]["dir"])
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    best_ckpt_callback = ModelCheckpoint(
+        dirpath=ckpt_dir,
+        filename="guard-best-{epoch}-{step}-{val_loss:.4f}",
+        monitor="val/loss",
+        mode="min",
+        save_top_k=3,
+        save_last=True,
+        auto_insert_metric_name=False,
+    )
+    step_ckpt_callback = ModelCheckpoint(
+        dirpath=ckpt_dir,
+        filename="guard-step-{epoch}-{step}",
+        save_top_k=-1,
+        every_n_train_steps=cfg["logging"]["save_every"],
+        save_on_train_epoch_end=False,
+        auto_insert_metric_name=False,
+    )
     callbacks = [
-        ModelCheckpoint(
-            dirpath=ckpt_dir,
-            filename="guard-best-{epoch}-{step}-{val_loss:.4f}",
-            monitor="val/loss",
-            mode="min",
-            save_top_k=3,
-            save_last=True,
-            auto_insert_metric_name=False,
-        ),
-        ModelCheckpoint(
-            dirpath=ckpt_dir,
-            filename="guard-step-{epoch}-{step}",
-            save_top_k=-1,
-            every_n_train_steps=cfg["logging"]["save_every"],
-            save_on_train_epoch_end=False,
-            auto_insert_metric_name=False,
-        ),
+        best_ckpt_callback,
+        step_ckpt_callback,
         LearningRateMonitor(logging_interval="step"),
     ]
 
@@ -440,6 +458,13 @@ def main():
             
     # --- logger ---
     if args.logger == "wandb":
+        try:
+            from lightning.pytorch.loggers import WandbLogger
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "wandb logger requested, but wandb is not installed. "
+                "Install wandb or use --logger tensorboard."
+            ) from exc
         experiment_logger = WandbLogger(project="generative_guard", save_dir=ckpt_dir / "logs")
     else:
         experiment_logger = TensorBoardLogger(save_dir=ckpt_dir / "logs", name="generative_guard")
@@ -462,7 +487,44 @@ def main():
     )
 
     trainer.fit(module, train_dl, val_dl, ckpt_path=args.resume)
-    trainer.save_checkpoint(ckpt_dir / "final.ckpt")
+    final_ckpt_path = ckpt_dir / "final.ckpt"
+    trainer.save_checkpoint(final_ckpt_path)
+
+    train_summary_path = ckpt_dir / "train_summary.json"
+    train_summary = {
+        "status": "completed",
+        "created_at": now_iso(),
+        "config_path": args.config,
+        "output_dir": str(ckpt_dir),
+        "logger": args.logger,
+        "devices": args.devices,
+        "num_nodes": args.num_nodes,
+        "strategy": args.strategy,
+        "resume_checkpoint": args.resume,
+        "seed": seed,
+        "best_checkpoint": best_ckpt_callback.best_model_path or None,
+        "best_score": maybe_to_float(best_ckpt_callback.best_model_score),
+        "last_checkpoint": best_ckpt_callback.last_model_path or None,
+        "final_checkpoint": str(final_ckpt_path),
+        "step_checkpoint_count": len(step_ckpt_callback.best_k_models),
+        "hf_export_dir": None,
+    }
+    if trainer.is_global_zero:
+        save_json(train_summary_path, train_summary)
+    
+    # --- automatic export of the best checkpoint to Hugging Face format ---
+    if trainer.is_global_zero and not args.skip_auto_export:
+        best_ckpt = best_ckpt_callback.best_model_path
+        if best_ckpt:
+            print(f"Экспорт лучшего чекпоинта: {best_ckpt}")
+            best_module = GenerativeGuardModule.load_from_checkpoint(best_ckpt, cfg=cfg, map_location="cpu")
+            hf_export_dir = ckpt_dir / "hf_model"
+            hf_export_dir.mkdir(parents=True, exist_ok=True)
+            best_module.model.model.save_pretrained(hf_export_dir)
+            best_module.model.tokenizer.save_pretrained(hf_export_dir)
+            print(f"HuggingFace модель успешно сохранена в {hf_export_dir}")
+            train_summary["hf_export_dir"] = str(hf_export_dir)
+            save_json(train_summary_path, train_summary)
 
 
 if __name__ == "__main__":

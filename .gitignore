@@ -214,3 +214,8 @@ __marimo__/
 
 **models
 **.ipynb
+runs/
+artifacts/
+checkpoints/
+tmp-runs/
+tmp-grid-runs/

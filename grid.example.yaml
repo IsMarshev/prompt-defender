@@ -1,0 +1,35 @@
+base_config: config.yaml
+run_root: runs/qwen3-grid
+
+train:
+  devices: 1
+  num_nodes: 1
+  strategy: auto
+  logger: tensorboard
+  seed: 42
+
+eval:
+  datasets:
+    val: datasets/val_merged.jsonl
+    thinking: thinking.jsonl
+  batch_size: 4
+  max_new_tokens: 256
+  dtype: auto
+  save_predictions: false
+
+constants:
+  data.include_response_tasks: true
+  logging.generative_eval_batches: 32
+
+matrix:
+  model.backbone:
+    - Qwen/Qwen3-0.6B
+    - Qwen/Qwen3-1.7B
+  training.learning_rate:
+    - 2.0e-5
+    - 1.0e-5
+  training.batch_size:
+    - 2
+    - 4
+
+name_template: "{model_backbone}-lr-{training_learning_rate}-bs-{training_batch_size}"
