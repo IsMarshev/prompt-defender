@@ -5,7 +5,7 @@ import argparse
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from eval import detect_default_device, parse_safety_label
+from prompt_defender.core.evaluation import detect_default_device, parse_safety_label
 
 
 def parse_args() -> argparse.Namespace:

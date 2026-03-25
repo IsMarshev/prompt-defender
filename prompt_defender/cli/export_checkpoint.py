@@ -4,8 +4,8 @@ from pathlib import Path
 
 import torch
 
-from experiment_utils import load_yaml, now_iso, save_json
-from model import PromptGuardGenModel
+from prompt_defender.core.model import PromptGuardGenModel
+from prompt_defender.pipeline.experiment_utils import load_yaml, now_iso, save_json
 
 
 def load_config(path: str) -> dict:

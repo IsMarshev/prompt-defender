@@ -217,5 +217,7 @@ __marimo__/
 runs/
 artifacts/
 checkpoints/
-tmp-runs/
+tmp-runs-org/
 tmp-grid-runs/
+tmp-runs/
+

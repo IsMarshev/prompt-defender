@@ -8,7 +8,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from experiment_utils import (
+from prompt_defender.pipeline.experiment_utils import (
     apply_overrides,
     build_run_name,
     load_json,
@@ -21,7 +21,7 @@ from experiment_utils import (
 )
 
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def parse_args() -> argparse.Namespace:

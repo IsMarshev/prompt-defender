@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -10,20 +9,14 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from experiment_utils import now_iso, save_json
-
-
-CANONICAL_LABELS = {
-    "safe": "Safe",
-    "unsafe": "Unsafe",
-    "controversial": "Controversial",
-}
-UNPARSED_LABEL = "Unparsed"
-SAFETY_PATTERN = re.compile(
-    r'(?i)(?:^|[\{\[\(,\n])\s*"?safety"?\s*[:=]\s*"?'
-    r"(safe|unsafe|controversial)\b"
+from prompt_defender.core.evaluation import (
+    RAW_PREDICTION_ORDER,
+    UNPARSED_LABEL,
+    canonicalize_label,
+    detect_default_device,
+    parse_safety_label,
 )
-RAW_PREDICTION_ORDER = ["Safe", "Controversial", "Unsafe", UNPARSED_LABEL]
+from prompt_defender.pipeline.experiment_utils import now_iso, save_json
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,33 +87,6 @@ def parse_args() -> argparse.Namespace:
         help="Print progress every N batches to stderr; set 0 to disable",
     )
     return parser.parse_args()
-
-
-def detect_default_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    mps_backend = getattr(torch.backends, "mps", None)
-    if mps_backend and mps_backend.is_available():
-        return "mps"
-    return "cpu"
-
-
-def canonicalize_label(label: Any) -> str:
-    if label is None:
-        return UNPARSED_LABEL
-
-    normalized = str(label).strip().lower()
-    if not normalized:
-        return UNPARSED_LABEL
-    return CANONICAL_LABELS.get(normalized, str(label).strip())
-
-
-def parse_safety_label(text: str) -> str:
-    match = SAFETY_PATTERN.search(text or "")
-    if not match:
-        return UNPARSED_LABEL
-    return canonicalize_label(match.group(1))
-
 
 def load_rows(path: Path, limit: int | None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
