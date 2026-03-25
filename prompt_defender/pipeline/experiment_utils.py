@@ -12,6 +12,7 @@ import yaml
 
 
 _NON_ALNUM_RE = re.compile(r"[^a-zA-Z0-9]+")
+_EXPERIMENT_NAME_RE = re.compile(r"^(?P<model>.+)-experiment-(?P<number>\d+)$")
 
 
 def now_iso() -> str:
@@ -108,6 +109,80 @@ def slugify(value: Any) -> str:
 
 def backbone_slug(backbone: str) -> str:
     return slugify(backbone.split("/")[-1] if "/" in backbone else backbone)
+
+
+def backbone_display_name(backbone: str) -> str:
+    text = str(backbone).strip()
+    if "/" in text:
+        text = text.split("/")[-1]
+    text = text.replace("\\", "-").replace("/", "-").strip()
+    return text or "model"
+
+
+def infer_experiment_root(checkpoints_dir: str | Path) -> Path:
+    ckpt_dir = Path(checkpoints_dir)
+    if not ckpt_dir.is_absolute():
+        ckpt_dir = (Path.cwd() / ckpt_dir).resolve()
+    else:
+        ckpt_dir = ckpt_dir.resolve()
+
+    run_dir = ckpt_dir.parent
+    if ckpt_dir.name == "checkpoints" and (
+        (run_dir / "resolved_config.yaml").exists()
+        or (run_dir / "experiment_summary.json").exists()
+    ):
+        return ckpt_dir.parent.parent
+    return ckpt_dir.parent
+
+
+def next_experiment_name(model_name: str, experiment_root: str | Path) -> str:
+    display_name = backbone_display_name(model_name)
+    root = Path(experiment_root)
+    logs_root = root / "logs"
+    highest_number = 0
+    registry_path = logs_root / "experiment_registry.json"
+
+    if logs_root.exists():
+        for candidate in logs_root.iterdir():
+            match = _EXPERIMENT_NAME_RE.match(candidate.name)
+            if not match:
+                continue
+            if match.group("model") != display_name:
+                continue
+            highest_number = max(highest_number, int(match.group("number")))
+
+    if registry_path.exists():
+        registry = load_json(registry_path)
+        highest_number = max(
+            highest_number,
+            int(registry.get("models", {}).get(display_name, 0)),
+        )
+
+    return f"{display_name}-experiment-{highest_number + 1}"
+
+
+def reserve_experiment_name(model_name: str, experiment_root: str | Path) -> tuple[str, Path]:
+    root = Path(experiment_root)
+    logs_root = root / "logs"
+    logs_root.mkdir(parents=True, exist_ok=True)
+    registry_path = logs_root / "experiment_registry.json"
+
+    experiment_name = next_experiment_name(model_name, root)
+    match = _EXPERIMENT_NAME_RE.match(experiment_name)
+    if not match:
+        raise ValueError(f"Generated invalid experiment name: {experiment_name}")
+
+    registry: dict[str, Any]
+    if registry_path.exists():
+        registry = load_json(registry_path)
+    else:
+        registry = {"models": {}}
+
+    models = registry.setdefault("models", {})
+    models[match.group("model")] = int(match.group("number"))
+    save_json(registry_path, registry)
+
+    return experiment_name, registry_path
 
 
 def build_run_name(

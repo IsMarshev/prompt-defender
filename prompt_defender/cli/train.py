@@ -29,7 +29,13 @@ from prompt_defender.core.evaluation import (
     parse_safety_label as parse_safety_label_text,
 )
 from prompt_defender.core.model import PromptGuardGenModel
-from prompt_defender.pipeline.experiment_utils import now_iso, save_json
+from prompt_defender.pipeline.experiment_utils import (
+    infer_experiment_root,
+    load_json,
+    now_iso,
+    reserve_experiment_name,
+    save_json,
+)
 
 
 UNKNOWN_SAFETY_LABEL_ID = len(SAFETY_LABEL_TO_ID)
@@ -380,6 +386,31 @@ def maybe_to_float(value):
     return float(value)
 
 
+def resolve_experiment_name(model_name: str, ckpt_dir: Path) -> tuple[str, Path, Path]:
+    metadata_path = ckpt_dir / "experiment_metadata.json"
+    if metadata_path.exists():
+        metadata = load_json(metadata_path)
+        existing_name = metadata.get("experiment_name")
+        if isinstance(existing_name, str) and existing_name.strip():
+            registry_path = infer_experiment_root(ckpt_dir) / "logs" / "experiment_registry.json"
+            return existing_name.strip(), metadata_path, registry_path
+
+    experiment_root = infer_experiment_root(ckpt_dir)
+    experiment_name, registry_path = reserve_experiment_name(model_name, experiment_root)
+    save_json(
+        metadata_path,
+        {
+            "created_at": now_iso(),
+            "model_name": model_name,
+            "experiment_name": experiment_name,
+            "experiment_root": str(experiment_root),
+            "experiment_registry_path": str(registry_path),
+            "checkpoints_dir": str(ckpt_dir),
+        },
+    )
+    return experiment_name, metadata_path, registry_path
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config.yaml")
@@ -424,6 +455,12 @@ def main():
     # --- callbacks ---
     ckpt_dir = Path(cfg["output"]["dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    experiment_name, experiment_metadata_path, experiment_registry_path = resolve_experiment_name(
+        cfg["model"]["backbone"],
+        ckpt_dir,
+    )
+    logger_logs_root = ckpt_dir / "logs"
+    logger_logs_root.mkdir(parents=True, exist_ok=True)
     best_ckpt_callback = ModelCheckpoint(
         dirpath=ckpt_dir,
         filename="guard-best-{epoch}-{step}-{val_loss:.4f}",
@@ -477,9 +514,17 @@ def main():
                 "wandb logger requested, but wandb is not installed. "
                 "Install wandb or use --logger tensorboard."
             ) from exc
-        experiment_logger = WandbLogger(project="generative_guard", save_dir=ckpt_dir / "logs")
+        experiment_logger = WandbLogger(
+            project="generative_guard",
+            name=experiment_name,
+            save_dir=logger_logs_root,
+        )
     else:
-        experiment_logger = TensorBoardLogger(save_dir=ckpt_dir / "logs", name="generative_guard")
+        experiment_logger = TensorBoardLogger(
+            save_dir=logger_logs_root,
+            name=experiment_name,
+            version="",
+        )
 
     # --- trainer ---
     trainer = L.Trainer(
@@ -508,6 +553,10 @@ def main():
         "created_at": now_iso(),
         "config_path": args.config,
         "output_dir": str(ckpt_dir),
+        "experiment_name": experiment_name,
+        "experiment_metadata_path": str(experiment_metadata_path),
+        "experiment_registry_path": str(experiment_registry_path),
+        "logs_root": str(logger_logs_root),
         "logger": args.logger,
         "devices": args.devices,
         "num_nodes": args.num_nodes,
