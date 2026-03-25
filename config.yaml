@@ -5,17 +5,17 @@ model:
   freeze_backbone: false            
 
 data:
-  train_path: "datasets/train_merged.jsonl"
-  val_path: "datasets/val_merged.jsonl"
+  train_path: "datasets/train_merged_annotated.jsonl"
+  val_path: "datasets/val_merged_annotated.jsonl"
   max_length: 2048
   include_response_tasks: true
   eval_max_new_tokens: 32
 
 training:
-  epochs: 3
+  epochs: 1
   batch_size: 4
-  gradient_accumulation_steps: 8 
-  learning_rate: 2.0e-5
+  gradient_accumulation_steps: 16
+  learning_rate: 3.0e-5
   weight_decay: 0.01
   warmup_ratio: 0.05
   max_grad_norm: 1.0

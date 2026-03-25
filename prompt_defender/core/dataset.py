@@ -194,6 +194,7 @@ class GuardDataset(Dataset):
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
+            padding_side="left",
             trust_remote_code=True,
         )
         if self.tokenizer.pad_token is None:

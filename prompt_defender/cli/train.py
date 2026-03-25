@@ -12,7 +12,6 @@ Multi-node:
 """
 
 import argparse
-import re
 from pathlib import Path
 
 import yaml
@@ -24,25 +23,23 @@ from lightning.pytorch.strategies import DDPStrategy
 from torch.optim import AdamW, Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
 
-from prompt_defender.core.dataset import SAFETY_LABEL_TO_ID, build_dataloader
+from prompt_defender.core.dataset import SAFETY_LABEL_TO_ID, SAFETY_PREFIX, build_dataloader
+from prompt_defender.core.evaluation import (
+    normalize_generated_safety_text,
+    parse_safety_label as parse_safety_label_text,
+)
 from prompt_defender.core.model import PromptGuardGenModel
 from prompt_defender.pipeline.experiment_utils import now_iso, save_json
 
 
 UNKNOWN_SAFETY_LABEL_ID = len(SAFETY_LABEL_TO_ID)
-SAFETY_PATTERN = re.compile(
-    r'(?i)(?:^|[\{\n,])\s*"?safety"?\s*[:=]\s*"?'
-    r"(safe|unsafe|controversial)\b"
-)
 
 
 def parse_safety_label(text: str) -> int:
-    match = SAFETY_PATTERN.search(text)
-    if not match:
-        return UNKNOWN_SAFETY_LABEL_ID
-
-    normalized = match.group(1).strip().lower().capitalize()
-    return SAFETY_LABEL_TO_ID.get(normalized, UNKNOWN_SAFETY_LABEL_ID)
+    return SAFETY_LABEL_TO_ID.get(
+        parse_safety_label_text(text),
+        UNKNOWN_SAFETY_LABEL_ID,
+    )
 
 
 def summarize_confusion(confusion: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -50,12 +47,14 @@ def summarize_confusion(confusion: torch.Tensor) -> dict[str, torch.Tensor]:
     class_count = len(SAFETY_LABEL_TO_ID)
 
     f1_scores = []
+    precisions = []
     recalls = []
     for class_idx in range(class_count):
         tp = confusion[class_idx, class_idx]
         fp = confusion[:, class_idx].sum() - tp
         fn = confusion[class_idx, :].sum() - tp
 
+        precisions.append(tp / (tp + fp).clamp_min(1.0))
         recalls.append(tp / (tp + fn).clamp_min(1.0))
         f1_scores.append((2.0 * tp) / (2.0 * tp + fp + fn).clamp_min(1.0))
 
@@ -65,6 +64,7 @@ def summarize_confusion(confusion: torch.Tensor) -> dict[str, torch.Tensor]:
 
     return {
         "macro_f1": torch.stack(f1_scores).mean(),
+        "macro_precision": torch.stack(precisions).mean(),
         "macro_recall": torch.stack(recalls).mean(),
         "accuracy": correct / total,
         "parse_rate": parsed / total,
@@ -145,21 +145,34 @@ class GenerativeGuardModule(L.LightningModule):
         if batch_size == 0:
             return []
 
+        prefix_ids = self.model.tokenizer(
+            SAFETY_PREFIX,
+            add_special_tokens=False,
+            return_attention_mask=False,
+        )["input_ids"]
+        prefix_len = len(prefix_ids)
         max_prompt_len = int(prompt_lengths.max().item())
-        if max_prompt_len <= 0:
-            return [""] * batch_size
+        total_input_len = max_prompt_len + prefix_len
 
-        prompt_input_ids = batch["input_ids"][:, :max_prompt_len].clone()
-        prompt_attention_mask = torch.zeros_like(prompt_input_ids)
+        prompt_input_ids = batch["input_ids"].new_full(
+            (batch_size, total_input_len),
+            self.model.pad_token_id,
+        )
+        prompt_attention_mask = batch["input_ids"].new_zeros((batch_size, total_input_len))
+        prefix_tensor = batch["input_ids"].new_tensor(prefix_ids)
 
         for row_idx, prompt_length in enumerate(prompt_lengths.tolist()):
-            if prompt_length <= 0:
-                prompt_input_ids[row_idx].fill_(self.model.pad_token_id)
-                continue
-
-            prompt_attention_mask[row_idx, :prompt_length] = 1
-            if prompt_length < max_prompt_len:
-                prompt_input_ids[row_idx, prompt_length:max_prompt_len] = self.model.pad_token_id
+            sequence_len = prompt_length + prefix_len
+            start_idx = total_input_len - sequence_len
+            if prompt_length > 0:
+                prompt_input_ids[row_idx, start_idx:start_idx + prompt_length] = batch["input_ids"][
+                    row_idx, :prompt_length
+                ]
+            prompt_input_ids[
+                row_idx,
+                start_idx + prompt_length:start_idx + sequence_len,
+            ] = prefix_tensor
+            prompt_attention_mask[row_idx, start_idx:start_idx + sequence_len] = 1
 
         generated = self.model.model.generate(
             input_ids=prompt_input_ids,
@@ -169,17 +182,16 @@ class GenerativeGuardModule(L.LightningModule):
             do_sample=False,
             synced_gpus=use_synced_gpus,
         )
-        generated_ids = generated[:, max_prompt_len:]
+        generated_ids = generated[:, total_input_len:]
 
         pred_texts = []
-        for row_idx, prompt_length in enumerate(prompt_lengths.tolist()):
-            if prompt_length <= 0:
-                pred_texts.append("")
-                continue
+        for row_idx, _prompt_length in enumerate(prompt_lengths.tolist()):
             pred_texts.append(
-                self.model.tokenizer.decode(
-                    generated_ids[row_idx],
-                    skip_special_tokens=True,
+                normalize_generated_safety_text(
+                    self.model.tokenizer.decode(
+                        generated_ids[row_idx],
+                        skip_special_tokens=True,
+                    )
                 )
             )
 
@@ -250,7 +262,7 @@ class GenerativeGuardModule(L.LightningModule):
             self.log(
                 f"val/{name}",
                 value,
-                prog_bar=name in {"macro_f1", "macro_recall", "accuracy"},
+                prog_bar=name in {"macro_f1", "macro_precision", "macro_recall", "accuracy"},
                 on_step=False,
                 on_epoch=True,
                 sync_dist=False,

@@ -5,7 +5,12 @@ import argparse
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from prompt_defender.core.evaluation import detect_default_device, parse_safety_label
+from prompt_defender.core.dataset import SAFETY_PREFIX
+from prompt_defender.core.evaluation import (
+    detect_default_device,
+    normalize_generated_safety_text,
+    parse_safety_label,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,6 +43,7 @@ def main() -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_path,
+        padding_side="left",
         trust_remote_code=True,
     )
     if tokenizer.pad_token is None:
@@ -60,6 +66,7 @@ def main() -> None:
         add_generation_prompt=False,
         enable_thinking=not args.disable_thinking,
     )
+    prompt_text = prompt_text + SAFETY_PREFIX
 
     inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
     with torch.inference_mode():
@@ -72,7 +79,9 @@ def main() -> None:
         )
 
     generated_ids = generated[:, inputs["input_ids"].shape[1]:]
-    output_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True).strip()
+    output_text = normalize_generated_safety_text(
+        tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    )
     predicted_label = parse_safety_label(output_text)
 
     print(f"Prediction:\n{output_text}")

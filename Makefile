@@ -14,6 +14,7 @@ CHECKPOINT ?=
 PROMPT ?=
 RESPONSE ?=
 EXTRA ?=
+WANDB_KEY=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
 
 .PHONY: help setup install train train-multi-gpu export eval infer experiment grid
 
@@ -44,12 +45,13 @@ setup: $(PY)
 
 install: setup
 	$(PIP) install -r requirements.txt
+	$(PY) -m wandb login $(WANDB_KEY)
 
 train: $(PY)
-	$(PY) -m $(CLI).train --config "$(CONFIG)" --logger tensorboard $(EXTRA)
+	$(PY) -m $(CLI).train --config "$(CONFIG)" --logger wandb $(EXTRA)
 
 train-multi-gpu: $(PY)
-	$(PY) -m $(CLI).train --config "$(CONFIG)" --devices 4 --strategy ddp $(EXTRA)
+	$(PY) -m $(CLI).train --config "$(CONFIG)" --devices 2 --strategy ddp --logger wandb $(EXTRA) 
 
 export: $(PY)
 	@test -n "$(CHECKPOINT)" || (echo "CHECKPOINT is required: make export CHECKPOINT=path/to/model.ckpt"; exit 1)

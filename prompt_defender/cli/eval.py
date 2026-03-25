@@ -14,8 +14,10 @@ from prompt_defender.core.evaluation import (
     UNPARSED_LABEL,
     canonicalize_label,
     detect_default_device,
+    normalize_generated_safety_text,
     parse_safety_label,
 )
+from prompt_defender.core.dataset import SAFETY_PREFIX
 from prompt_defender.pipeline.experiment_utils import now_iso, save_json
 
 
@@ -172,7 +174,7 @@ def evaluate_rows(
             tokenizer=tokenizer,
             messages=get_messages(row),
             enable_thinking=not args.disable_thinking,
-        )
+        ) + SAFETY_PREFIX
         for row in rows
     ]
 
@@ -202,9 +204,10 @@ def evaluate_rows(
             for offset, raw_output in enumerate(batch_outputs):
                 row = rows[start + offset]
                 gold_label = canonicalize_label(row.get("label"))
-                predicted_label = parse_safety_label(raw_output)
+                normalized_output = normalize_generated_safety_text(raw_output)
+                predicted_label = parse_safety_label(normalized_output)
                 result = dict(row)
-                result["guard_predict"] = raw_output.strip()
+                result["guard_predict"] = normalized_output
                 result["guard_predicted_label"] = predicted_label
                 result["guard_gold_label"] = gold_label
                 results.append(result)
@@ -348,6 +351,7 @@ def main() -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
+        padding_side="left",
         trust_remote_code=True,
     )
     if tokenizer.pad_token is None:

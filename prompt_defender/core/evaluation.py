@@ -16,6 +16,7 @@ SAFETY_PATTERN = re.compile(
     r'(?i)(?:^|[\{\[\(,\n])\s*"?safety"?\s*[:=]\s*"?'
     r"(safe|unsafe|controversial)\b"
 )
+BARE_SAFETY_PATTERN = re.compile(r'(?i)^\s*"?\s*(safe|unsafe|controversial)\b')
 RAW_PREDICTION_ORDER = ["Safe", "Controversial", "Unsafe", UNPARSED_LABEL]
 
 
@@ -38,8 +39,19 @@ def canonicalize_label(label: Any) -> str:
     return CANONICAL_LABELS.get(normalized, str(label).strip())
 
 
+def normalize_generated_safety_text(text: str) -> str:
+    normalized = (text or "").strip()
+    if not normalized:
+        return ""
+    if SAFETY_PATTERN.search(normalized):
+        return normalized
+    if BARE_SAFETY_PATTERN.search(normalized):
+        return f"Safety: {normalized}"
+    return normalized
+
+
 def parse_safety_label(text: str) -> str:
-    match = SAFETY_PATTERN.search(text or "")
+    match = SAFETY_PATTERN.search(normalize_generated_safety_text(text))
     if not match:
         return UNPARSED_LABEL
     return canonicalize_label(match.group(1))

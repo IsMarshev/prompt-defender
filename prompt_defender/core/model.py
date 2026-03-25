@@ -8,6 +8,7 @@ class PromptGuardGenModel(nn.Module):
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name,
+            padding_side="left",
             trust_remote_code=True,
         )
         if self.tokenizer.pad_token is None:
@@ -18,6 +19,7 @@ class PromptGuardGenModel(nn.Module):
             trust_remote_code=True,
         )
         self.model.config.pad_token_id = self.tokenizer.pad_token_id
+        self.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
 
         if freeze_backbone:
             for param in self.model.parameters():
