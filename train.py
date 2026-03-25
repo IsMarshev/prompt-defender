@@ -19,7 +19,7 @@ import yaml
 import torch
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
-from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 from lightning.pytorch.strategies import DDPStrategy
 from torch.optim import AdamW, Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
@@ -366,6 +366,7 @@ def main():
     parser.add_argument("--num_nodes", type=int, default=1)
     parser.add_argument("--strategy", type=str, default="auto")
     parser.add_argument("--resume", type=str, default=None, help="path to checkpoint")
+    parser.add_argument("--logger", type=str, default="tensorboard", choices=["tensorboard", "wandb"], help="Logger to use")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -420,6 +421,14 @@ def main():
     strategy = args.strategy
     if strategy == "ddp":
         strategy = DDPStrategy(find_unused_parameters=False)
+    
+    if strategy == "fsdp":
+        strategy = L.strategies.FSDPStrategy(
+            auto_wrap_policy=L.strategies.fsdp.auto_wrap.AutoWrapPolicy(
+                {PromptGuardGenModel}
+            ),
+            param_init_fn=L.strategies.fsdp.default_param_init_fn,
+        )
 
     # --- precision ---
     if cfg["training"]["bf16"]:
@@ -428,6 +437,12 @@ def main():
         precision = "16-mixed"
     else:
         precision = "32-true"
+            
+    # --- logger ---
+    if args.logger == "wandb":
+        experiment_logger = WandbLogger(project="generative_guard", save_dir=ckpt_dir / "logs")
+    else:
+        experiment_logger = TensorBoardLogger(save_dir=ckpt_dir / "logs", name="generative_guard")
 
     # --- trainer ---
     trainer = L.Trainer(
@@ -442,7 +457,7 @@ def main():
         val_check_interval=cfg["logging"]["eval_every"],
         limit_val_batches=cfg["logging"].get("limit_val_batches", 128),
         callbacks=callbacks,
-        logger=TensorBoardLogger(save_dir=ckpt_dir / "logs", name="generative_guard"),
+        logger=experiment_logger,
         enable_progress_bar=True,
     )
 
