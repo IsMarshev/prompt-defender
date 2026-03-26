@@ -417,6 +417,10 @@ def maybe_to_float(value):
     return float(value)
 
 
+def is_distributed_run(args: argparse.Namespace) -> bool:
+    return int(args.devices) * int(args.num_nodes) > 1
+
+
 def resolve_experiment_name(model_name: str, ckpt_dir: Path) -> tuple[str, Path, Path]:
     metadata_path = ckpt_dir / "experiment_metadata.json"
     if metadata_path.exists():
@@ -461,6 +465,9 @@ def main():
 
     cfg = load_config(args.config)
     seed = args.seed if args.seed is not None else cfg.get("training", {}).get("seed")
+    distributed_run = is_distributed_run(args)
+    train_drop_last = bool(cfg["data"].get("train_drop_last", distributed_run))
+    val_drop_last = bool(cfg["data"].get("val_drop_last", False))
 
     if seed is not None:
         L.seed_everything(seed, workers=True)
@@ -474,6 +481,7 @@ def main():
         shuffle=True,
         num_workers=cfg["output"]["num_workers"],
         include_response_tasks=cfg["data"].get("include_response_tasks", True),
+        drop_last=train_drop_last,
     )
     val_dl = build_dataloader(
         data_path=cfg["data"]["val_path"],
@@ -483,6 +491,7 @@ def main():
         shuffle=False,
         num_workers=cfg["output"]["num_workers"],
         include_response_tasks=cfg["data"].get("include_response_tasks", True),
+        drop_last=val_drop_last,
     )
 
     # --- model ---
@@ -574,6 +583,7 @@ def main():
         callbacks=callbacks,
         logger=experiment_logger,
         enable_progress_bar=True,
+        use_distributed_sampler=True,
     )
 
     trainer.fit(module, train_dl, val_dl, ckpt_path=args.resume)
@@ -594,6 +604,9 @@ def main():
         "devices": args.devices,
         "num_nodes": args.num_nodes,
         "strategy": args.strategy,
+        "distributed_run": distributed_run,
+        "train_drop_last": train_drop_last,
+        "val_drop_last": val_drop_last,
         "resume_checkpoint": args.resume,
         "seed": seed,
         "best_checkpoint": best_ckpt_callback.best_model_path or None,

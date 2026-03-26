@@ -10,6 +10,8 @@ data:
   max_length: 2048
   include_response_tasks: true
   eval_max_new_tokens: 32
+  train_drop_last: true            # safer for multi-GPU: avoid uneven last train batch across ranks
+  val_drop_last: false             # keep full val set by default; set true if you hit uneven-val hangs
 
 training:
   epochs: 1

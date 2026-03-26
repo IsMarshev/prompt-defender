@@ -318,6 +318,7 @@ def build_dataloader(
     shuffle: bool = True,
     num_workers: int = 0,
     include_response_tasks: bool = True,
+    drop_last: bool = False,
 ) -> DataLoader:
     dataset = GuardDataset(
         data_path=data_path,
@@ -332,4 +333,5 @@ def build_dataloader(
         collate_fn=partial(collate_fn, pad_token_id=dataset.tokenizer.pad_token_id),
         num_workers=num_workers,
         pin_memory=True,
+        drop_last=drop_last,
     )
