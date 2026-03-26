@@ -19,7 +19,7 @@ import torch
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import TensorBoardLogger
-from lightning.pytorch.strategies import DDPStrategy
+from lightning.pytorch.strategies import DDPStrategy, FSDPStrategy
 from torch.optim import AdamW, Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
 
@@ -524,13 +524,10 @@ def main():
     strategy = args.strategy
     if strategy == "ddp":
         strategy = DDPStrategy(find_unused_parameters=False)
-    
-    if strategy == "fsdp":
-        strategy = L.strategies.FSDPStrategy(
-            auto_wrap_policy=L.strategies.fsdp.auto_wrap.AutoWrapPolicy(
-                {PromptGuardGenModel}
-            ),
-            param_init_fn=L.strategies.fsdp.default_param_init_fn,
+
+    elif strategy == "fsdp":
+        strategy = FSDPStrategy(
+            auto_wrap_policy={PromptGuardGenModel},
         )
 
     # --- precision ---
