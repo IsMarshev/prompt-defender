@@ -237,6 +237,7 @@ class GuardDataset(Dataset):
         prompt_text = self.tokenizer.apply_chat_template(
             sample["messages"],
             tokenize=False,
+            chat_template_kwargs={"enable_thinking": False}
         )
         target_text = sample["target_text"]
 

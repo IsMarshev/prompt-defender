@@ -7,7 +7,7 @@ CLI := prompt_defender.cli
 CONFIG ?= config.yaml
 GRID ?= grid.example.yaml
 RUN_ROOT ?=
-MODEL_PATH ?= models/guard_model
+MODEL_PATH ?= checkpoints/hf_model
 DATA_PATH ?= thinking.jsonl
 EXPORT_DIR ?= artifacts/guard_model
 CHECKPOINT ?=
@@ -58,7 +58,7 @@ export: $(PY)
 	$(PY) -m $(CLI).export_checkpoint --config "$(CONFIG)" --checkpoint "$(CHECKPOINT)" --output-dir "$(EXPORT_DIR)" $(EXTRA)
 
 eval: $(PY)
-	$(PY) -m $(CLI).eval --model-path "$(MODEL_PATH)" --data-path "$(DATA_PATH)" $(EXTRA)
+	$(PY) -m $(CLI).eval --model-path "$(MODEL_PATH)" --data-path "$(DATA_PATH)" --batch-size 16 $(EXTRA) 
 
 infer: $(PY)
 	@test -n "$(PROMPT)" || (echo "PROMPT is required: make infer MODEL_PATH=... PROMPT='...'" ; exit 1)

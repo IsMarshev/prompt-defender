@@ -94,6 +94,18 @@ def compute_metrics(pred_texts: list[str], true_label_ids: torch.Tensor) -> dict
     return metrics
 
 
+def compute_grad_norm(parameters, norm_type: float = 2.0) -> torch.Tensor:
+    grads = [parameter.grad.detach() for parameter in parameters if parameter.grad is not None]
+    if not grads:
+        return torch.tensor(0.0)
+
+    if norm_type == float("inf"):
+        return torch.stack([grad.abs().max() for grad in grads]).max()
+
+    per_parameter_norms = torch.stack([torch.norm(grad, norm_type) for grad in grads])
+    return torch.norm(per_parameter_norms, norm_type)
+
+
 class GenerativeGuardModule(L.LightningModule):
     def __init__(self, cfg: dict):
         super().__init__()
@@ -231,6 +243,25 @@ class GenerativeGuardModule(L.LightningModule):
         self.log("train_token_acc", acc, prog_bar=False, sync_dist=True)
 
         return loss
+
+    def on_before_optimizer_step(self, optimizer):
+        grad_norm = compute_grad_norm(self.parameters()).to(self.device)
+        self.log(
+            "train/grad_norm",
+            grad_norm,
+            prog_bar=False,
+            on_step=True,
+            on_epoch=False,
+            sync_dist=False,
+        )
+        self.log(
+            "train_grad_norm",
+            grad_norm,
+            prog_bar=False,
+            on_step=True,
+            on_epoch=False,
+            sync_dist=False,
+        )
 
     def validation_step(self, batch, batch_idx):
         loss, acc = self._shared_step(batch)
@@ -391,7 +422,12 @@ def resolve_experiment_name(model_name: str, ckpt_dir: Path) -> tuple[str, Path,
     if metadata_path.exists():
         metadata = load_json(metadata_path)
         existing_name = metadata.get("experiment_name")
-        if isinstance(existing_name, str) and existing_name.strip():
+        existing_model_name = metadata.get("model_name")
+        if (
+            isinstance(existing_name, str)
+            and existing_name.strip()
+            and existing_model_name == model_name
+        ):
             registry_path = infer_experiment_root(ckpt_dir) / "logs" / "experiment_registry.json"
             return existing_name.strip(), metadata_path, registry_path
 
