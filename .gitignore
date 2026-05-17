@@ -216,3 +216,15 @@ __marimo__/
 **.json
 
 **data
+
+**datasets
+
+**.ipynb
+
+**tmp-runs-org
+**tmp-runs
+**models
+**checkpoints
+**artifacts
+**tmp-grid-runs
+**prompt_defender
