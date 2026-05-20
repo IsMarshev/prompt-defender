@@ -108,9 +108,12 @@ def load_rows(path: Path, limit: int | None) -> list[dict[str, Any]]:
 
 def get_messages(row: dict[str, Any]) -> list[dict[str, Any]]:
     messages = row.get("messages") or row.get("message") or []
-    if not isinstance(messages, list) or not messages:
-        raise ValueError(f"Row is missing a non-empty messages/message list: {row}")
-    return messages
+    if isinstance(messages, list) and messages:
+        return messages
+    instruction = row.get("instruction")
+    if instruction:
+        return [{"role": "user", "content": instruction}]
+    raise ValueError(f"Row is missing a non-empty messages/message/instruction field: {row}")
 
 
 def build_prompt_text(

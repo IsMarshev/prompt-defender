@@ -182,7 +182,23 @@ class GuardDataset(Dataset):
             self._cache.append(item)
             self._lengths.append(item["input_ids"].size(0))
 
+    @staticmethod
+    def _normalize_sample(sample: dict) -> dict:
+        """Convert flat instruction-format records to the messages-based format."""
+        if sample.get("messages"):
+            return sample
+        instruction = sample.get("instruction")
+        if not instruction:
+            return sample
+        return {
+            **sample,
+            "messages": [{"role": "user", "content": instruction}],
+            "query_safety": sample.get("label", "safe"),
+            "query_category": sample.get("category", "None"),
+        }
+
     def _expand_sample(self, sample: dict, include_response_tasks: bool) -> list[dict]:
+        sample = self._normalize_sample(sample)
         messages = sample.get("messages") or []
         if not messages:
             return []
