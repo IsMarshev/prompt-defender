@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, BatchSampler
 from transformers import AutoTokenizer
+from tqdm import tqdm
 
 
 RISK_DISPLAY = {
@@ -145,13 +146,12 @@ class GuardDataset(Dataset):
     ):
         self.samples: list[dict] = []
         with open(data_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    sample = json.loads(line)
-                    self.samples.extend(
-                        self._expand_sample(sample, include_response_tasks=include_response_tasks)
-                    )
+            lines = [l.strip() for l in f if l.strip()]
+        for line in tqdm(lines, desc=f"Loading {data_path}", unit="rec"):
+            sample = json.loads(line)
+            self.samples.extend(
+                self._expand_sample(sample, include_response_tasks=include_response_tasks)
+            )
 
         # Tokenizer used for actual encoding
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -177,7 +177,7 @@ class GuardDataset(Dataset):
         # tokenisation during training and gives exact lengths for packing.
         self._cache: list[dict] = []
         self._lengths: list[int] = []
-        for sample in self.samples:
+        for sample in tqdm(self.samples, desc="Tokenizing", unit="ex"):
             item = self._tokenize(sample)
             self._cache.append(item)
             self._lengths.append(item["input_ids"].size(0))
@@ -185,8 +185,17 @@ class GuardDataset(Dataset):
     @staticmethod
     def _normalize_sample(sample: dict) -> dict:
         """Convert flat instruction-format records to the messages-based format."""
-        if sample.get("messages"):
+        messages = sample.get("messages")
+
+        # Single message stored as dict instead of list — wrap it
+        if isinstance(messages, dict):
+            return {**sample, "messages": [messages]}
+
+        # Already a proper list
+        if isinstance(messages, list) and messages:
             return sample
+
+        # Flat format: instruction / label / category
         instruction = sample.get("instruction")
         if not instruction:
             return sample
@@ -230,7 +239,6 @@ class GuardDataset(Dataset):
             sample["messages"],
             tokenize=False,
             add_generation_prompt=False,
-            chat_template_kwargs={"enable_thinking": False},
         )
         prompt_ids: list[int] = self.tokenizer(
             prompt_text,
@@ -357,7 +365,7 @@ def packed_collate_fn(batch: list[dict], pad_token_id: int) -> dict:
     position_ids = torch.stack(position_ids_list)
 
     # 4-D block-diagonal mask — one per batch item
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+    dtype = torch.bfloat16
     masks = []
     for seqlens in all_seqlens:
         total = sum(seqlens)

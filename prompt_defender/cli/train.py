@@ -468,6 +468,9 @@ def main():
     parser.add_argument("--skip-auto-export", action="store_true")
     args = parser.parse_args()
 
+    torch.backends.cuda.enable_cudnn_sdp(False)
+    torch.set_float32_matmul_precision("high")
+
     cfg = load_config(args.config)
     seed = args.seed if args.seed is not None else cfg.get("training", {}).get("seed")
     distributed_run = is_distributed_run(args)
@@ -631,7 +634,15 @@ def main():
             hf_export_dir = ckpt_dir / "hf_model"
             hf_export_dir.mkdir(parents=True, exist_ok=True)
             best_module.model.model.save_pretrained(hf_export_dir)
-            best_module.model.tokenizer.save_pretrained(hf_export_dir)
+            # Save the template tokenizer (with the guard chat template) if configured,
+            # otherwise fall back to the base tokenizer. This ensures the exported model
+            # is always evaluated with the same prompt format it was trained on.
+            if template_tokenizer:
+                from transformers import AutoTokenizer as _AT
+                _tmpl_tok = _AT.from_pretrained(template_tokenizer, trust_remote_code=True)
+                _tmpl_tok.save_pretrained(hf_export_dir)
+            else:
+                best_module.model.tokenizer.save_pretrained(hf_export_dir)
             print(f"HuggingFace модель успешно сохранена в {hf_export_dir}")
             train_summary["hf_export_dir"] = str(hf_export_dir)
             save_json(train_summary_path, train_summary)

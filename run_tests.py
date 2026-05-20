@@ -6,13 +6,13 @@ Each model × dataset is run independently; results are saved to
 tests/{model_name}__{dataset}.json  (or tests/{model_name}.json for "test").
 Labels are binary (Safe / Unsafe). "Controversial" is treated as positive.
 
-Available datasets:
-  test         datasets/test.json          (default combined set)
-  aegis        datasets/aegis_test.json
-  beavertails  datasets/beavertails_test.json
-  toxicchat    datasets/toxicchat_test.json
-  wildguard    datasets/wildguard_test.json
-  jdd          datasets/jdd_test.json
+Available datasets (all drawn from datasets/test_merged_clean.jsonl):
+  test         all rows  (default)
+  aegis        dataset == "aegis"
+  beavertails  dataset == "beavertails"
+  toxicchat    dataset == "toxicchat"
+  wildguard    dataset == "wildguard"
+  jdd          dataset == "jdd"
 
 Usage:
     python run_tests.py                                    # all models, test set
@@ -45,22 +45,22 @@ from prompt_defender.core.evaluation import (
 )
 
 ARTIFACTS_DIR = Path("artifacts")
+MERGED_TEST = Path("datasets/test_merged_clean.jsonl")
 
 # For binary evaluation: Unsafe (and Controversial) are "positive"
 GOLD_POSITIVE = {"Unsafe"}
 PRED_POSITIVE = {"Unsafe", "Controversial"}
 
-# All available test datasets
-TEST_DATASETS: dict[str, Path] = {
-    "test":        Path("datasets/test.json"),
-    "aegis":       Path("datasets/aegis_test.json"),
-    "beavertails": Path("datasets/beavertails_test.json"),
-    "toxicchat":   Path("datasets/toxicchat_test.json"),
-    "wildguard":   Path("datasets/wildguard_test.json"),
-    "jdd":         Path("datasets/jdd_test.json"),
+# dataset name → value of the "dataset" field to filter on (None = all rows)
+TEST_DATASETS: dict[str, str | None] = {
+    "test":        None,
+    "aegis":       "aegis",
+    "beavertails": "beavertails",
+    "toxicchat":   "toxicchat",
+    "wildguard":   "wildguard",
+    "jdd":         "jdd",
 }
 
-# Mapping for sequence-classification label strings → canonical safety labels
 _CLASSIFIER_LABEL_MAP = {
     "safe":      "Safe",
     "injection": "Unsafe",
@@ -75,7 +75,6 @@ _CLASSIFIER_LABEL_MAP = {
 # ---------------------------------------------------------------------------
 
 def detect_model_type(model_dir: Path) -> str:
-    """Return 'classifier' or 'generative' based on config.json architectures."""
     cfg_path = model_dir / "config.json"
     if cfg_path.exists():
         cfg = json.loads(cfg_path.read_text())
@@ -108,7 +107,6 @@ def load_classifier(model_dir: Path, device: str):
         model_dir, torch_dtype=torch.bfloat16, trust_remote_code=True
     ).to(device)
     model.eval()
-    # Build label map: id → canonical safety label
     cfg = json.loads((model_dir / "config.json").read_text())
     id2label = cfg.get("id2label", {})
     label_map = {
@@ -122,23 +120,15 @@ def load_classifier(model_dir: Path, device: str):
 # Inference — generative
 # ---------------------------------------------------------------------------
 
-def _user_messages(row: dict) -> list[dict]:
-    messages = list(row.get("messages") or row.get("message") or [])
-    if messages and messages[-1].get("role") == "assistant":
-        messages = messages[:-1]
-    return messages
-
-
 def build_gen_prompt(tokenizer, row: dict) -> str:
-    messages = _user_messages(row)
+    messages = [{"role": "user", "content": row["instruction"]}]
     try:
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False, enable_thinking=False,
-        )
-    except TypeError:
         text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False,
         )
+    except (TypeError, ValueError):
+        # Fallback: no chat template available — use raw instruction
+        text = row["instruction"]
     return text + SAFETY_PREFIX
 
 
@@ -170,10 +160,9 @@ def run_generative(model, tokenizer, rows, batch_size, max_new_tokens, device):
                 normalized = normalize_generated_safety_text(raw_output)
                 predicted = parse_safety_label(normalized)
                 results.append({
-                    "unique_id": row.get("unique_id"),
                     "label": row.get("label"),
-                    "unsafe_type": row.get("unsafe_type"),
-                    "source": row.get("source"),
+                    "category": row.get("category"),
+                    "dataset": row.get("dataset"),
                     "guard_raw_output": raw_output,
                     "guard_predict": normalized,
                     "guard_predicted_label": predicted,
@@ -191,15 +180,8 @@ def run_generative(model, tokenizer, rows, batch_size, max_new_tokens, device):
 # Inference — sequence classifier
 # ---------------------------------------------------------------------------
 
-def _extract_user_text(row: dict) -> str:
-    """Concatenate user turns into a single string for classifier input."""
-    messages = list(row.get("messages") or row.get("message") or [])
-    user_parts = [m["content"] for m in messages if m.get("role") == "user"]
-    return " ".join(user_parts)
-
-
 def run_classifier(model, tokenizer, label_map, rows, batch_size, device):
-    texts = [_extract_user_text(r) for r in rows]
+    texts = [r["instruction"] for r in rows]
     results: list[dict] = []
 
     with torch.inference_mode():
@@ -220,10 +202,9 @@ def run_classifier(model, tokenizer, label_map, rows, batch_size, device):
                 predicted = label_map.get(pred_id, UNPARSED_LABEL)
                 raw = f"label_id={pred_id} ({label_map.get(pred_id, '?')})"
                 results.append({
-                    "unique_id": row.get("unique_id"),
                     "label": row.get("label"),
-                    "unsafe_type": row.get("unsafe_type"),
-                    "source": row.get("source"),
+                    "category": row.get("category"),
+                    "dataset": row.get("dataset"),
                     "guard_raw_output": raw,
                     "guard_predict": f"Safety: {predicted}",
                     "guard_predicted_label": predicted,
@@ -318,8 +299,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _resolve_datasets(requested: list[str]) -> dict[str, Path]:
-    """Expand 'all' and validate dataset names."""
+def _resolve_datasets(requested: list[str]) -> dict[str, str | None]:
     if "all" in requested:
         return dict(TEST_DATASETS)
     unknown = [d for d in requested if d not in TEST_DATASETS]
@@ -333,12 +313,21 @@ def _resolve_datasets(requested: list[str]) -> dict[str, Path]:
     return {k: TEST_DATASETS[k] for k in requested}
 
 
-def _load_dataset(path: Path) -> list[dict]:
-    if not path.exists():
+def _load_dataset(dataset_filter: str | None) -> list[dict]:
+    if not MERGED_TEST.exists():
         raise FileNotFoundError(
-            f"{path} not found — run `python prepare_test_datasets.py` first."
+            f"{MERGED_TEST} not found."
         )
-    return json.loads(path.read_text(encoding="utf-8"))
+    rows = []
+    with open(MERGED_TEST, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if dataset_filter is None or row.get("dataset") == dataset_filter:
+                rows.append(row)
+    return rows
 
 
 def main() -> None:
@@ -352,7 +341,6 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Discover models: all subdirs in artifacts/ (or --only filter)
     model_dirs = sorted(d for d in ARTIFACTS_DIR.iterdir() if d.is_dir())
     if args.only:
         model_dirs = [d for d in model_dirs if d.name in args.only]
@@ -374,9 +362,9 @@ def main() -> None:
         else:
             model, tokenizer = load_generative(model_dir, device)
 
-        for dataset_name, dataset_path in datasets.items():
-            print(f"  -- dataset: {dataset_name} ({dataset_path})")
-            rows: list[dict] = _load_dataset(dataset_path)
+        for dataset_name, dataset_filter in datasets.items():
+            print(f"  -- dataset: {dataset_name}")
+            rows: list[dict] = _load_dataset(dataset_filter)
             print(f"     {len(rows):,} samples")
 
             if model_type == "classifier":
@@ -405,7 +393,6 @@ def main() -> None:
 
             safe_name = model_name.replace(".", "_").replace(" ", "_")
             if dataset_name == "test":
-                # keep backward-compatible filename for the main test set
                 out_path = out_dir / f"{safe_name}.json"
             else:
                 out_path = out_dir / f"{safe_name}__{dataset_name}.json"
