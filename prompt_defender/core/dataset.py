@@ -4,13 +4,25 @@ Dataset for Qwen3Guard-Gen style generative training.
 Each JSONL row is converted into one or two instruction-following samples:
 1. Prompt moderation: classify the user-side conversation state.
 2. Response moderation: classify the assistant response, if present.
+
+Packing mode (packing=True):
+  Examples are sorted by length and grouped into same-length buckets so each
+  micro-batch is filled to near-max_length with minimal padding.  A 4-D
+  block-diagonal causal attention mask is built per batch item, preventing
+  any cross-example attention.  Works with attn_implementation="sdpa" or
+  "eager"; Flash Attention 2 uses its own varlen path via _upad_input when
+  attention_mask contains padding zeros.
 """
 
+from __future__ import annotations
+
 import json
+import random
 from functools import partial
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, BatchSampler
 from transformers import AutoTokenizer
 
 
@@ -92,21 +104,8 @@ def trim_messages_for_prompt_moderation(messages: list[dict]) -> list[dict]:
     return messages
 
 
-def _find_subsequence(sequence: list[int], subsequence: list[int]) -> int:
-    if not subsequence or len(subsequence) > len(sequence):
-        return -1
-
-    last_start = len(sequence) - len(subsequence)
-    for start in range(last_start + 1):
-        if sequence[start:start + len(subsequence)] == subsequence:
-            return start
-    return -1
-
-
-def build_target_ids_and_loss_mask(
-    tokenizer,
-    target_text: str,
-) -> tuple[list[int], list[bool], str]:
+def build_target_ids(tokenizer, target_text: str) -> tuple[list[int], str]:
+    """Tokenise target_text + EOS, return (token_ids, safety_label)."""
     safety_line = target_text.splitlines()[0]
     if not safety_line.startswith(SAFETY_PREFIX):
         raise ValueError(f"Unsupported target format: {target_text!r}")
@@ -116,62 +115,23 @@ def build_target_ids_and_loss_mask(
         raise ValueError(f"Unsupported safety label: {safety_label!r}")
 
     target_with_eos = target_text + tokenizer.eos_token
-    use_offsets = getattr(tokenizer, "is_fast", False)
-    tokenized = tokenizer(
+    target_ids = tokenizer(
         target_with_eos,
         add_special_tokens=False,
         return_attention_mask=False,
-        return_offsets_mapping=use_offsets,
-    )
-
-    target_ids = tokenized["input_ids"]
-    label_start = len(SAFETY_PREFIX)
-    label_end = label_start + len(safety_label)
-
-    if use_offsets:
-        target_loss_mask = [
-            offset_end > label_start and offset_start < label_end
-            for offset_start, offset_end in tokenized["offset_mapping"]
-        ]
-    else:
-        target_loss_mask = [False] * len(target_ids)
-        label_variants = [
-            f" {safety_label}",
-            safety_label,
-        ]
-        for variant in label_variants:
-            variant_ids = tokenizer(
-                variant,
-                add_special_tokens=False,
-                return_attention_mask=False,
-            )["input_ids"]
-            start = _find_subsequence(target_ids, variant_ids)
-            if start == -1:
-                continue
-            for idx in range(start, start + len(variant_ids)):
-                target_loss_mask[idx] = True
-            break
-
-        if not any(target_loss_mask):
-            raise ValueError("Could not locate safety label tokens in target text.")
-
-    return target_ids, target_loss_mask, safety_label
+    )["input_ids"]
+    return target_ids, safety_label
 
 
-def truncate_pair(
+def truncate_to_max(
     prompt_ids: list[int],
     target_ids: list[int],
-    target_loss_mask: list[bool],
     max_length: int,
-) -> tuple[list[int], list[int], list[bool]]:
+) -> tuple[list[int], list[int]]:
     if len(target_ids) >= max_length:
-        return [], target_ids[:max_length], target_loss_mask[:max_length]
-
+        return [], target_ids[:max_length]
     max_prompt_len = max_length - len(target_ids)
-    if len(prompt_ids) > max_prompt_len:
-        prompt_ids = prompt_ids[-max_prompt_len:]
-
-    return prompt_ids, target_ids, target_loss_mask
+    return prompt_ids[-max_prompt_len:], target_ids
 
 
 class GuardDataset(Dataset):
@@ -181,8 +141,9 @@ class GuardDataset(Dataset):
         tokenizer_name: str,
         max_length: int = 2048,
         include_response_tasks: bool = True,
+        template_tokenizer_name: str | None = None,
     ):
-        self.samples = []
+        self.samples: list[dict] = []
         with open(data_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -192,6 +153,7 @@ class GuardDataset(Dataset):
                         self._expand_sample(sample, include_response_tasks=include_response_tasks)
                     )
 
+        # Tokenizer used for actual encoding
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
             padding_side="left",
@@ -199,7 +161,26 @@ class GuardDataset(Dataset):
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # Separate tokenizer for apply_chat_template (guard model has the right template)
+        if template_tokenizer_name and template_tokenizer_name != tokenizer_name:
+            self.template_tokenizer = AutoTokenizer.from_pretrained(
+                template_tokenizer_name,
+                trust_remote_code=True,
+            )
+        else:
+            self.template_tokenizer = self.tokenizer
+
         self.max_length = max_length
+
+        # Pre-tokenize all samples once and cache.  This eliminates double
+        # tokenisation during training and gives exact lengths for packing.
+        self._cache: list[dict] = []
+        self._lengths: list[int] = []
+        for sample in self.samples:
+            item = self._tokenize(sample)
+            self._cache.append(item)
+            self._lengths.append(item["input_ids"].size(0))
 
     def _expand_sample(self, sample: dict, include_response_tasks: bool) -> list[dict]:
         messages = sample.get("messages") or []
@@ -228,87 +209,263 @@ class GuardDataset(Dataset):
 
         return examples
 
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-
-        prompt_text = self.tokenizer.apply_chat_template(
+    def _tokenize(self, sample: dict) -> dict:
+        prompt_text = self.template_tokenizer.apply_chat_template(
             sample["messages"],
             tokenize=False,
-            chat_template_kwargs={"enable_thinking": False}
+            add_generation_prompt=False,
+            chat_template_kwargs={"enable_thinking": False},
         )
-        target_text = sample["target_text"]
-
-        prompt_ids = self.tokenizer(
+        prompt_ids: list[int] = self.tokenizer(
             prompt_text,
             add_special_tokens=False,
             return_attention_mask=False,
         )["input_ids"]
-        target_ids, target_loss_mask, safety_label = build_target_ids_and_loss_mask(
-            self.tokenizer,
-            target_text,
-        )
 
-        prompt_ids, target_ids, target_loss_mask = truncate_pair(
-            prompt_ids,
-            target_ids,
-            target_loss_mask,
-            self.max_length,
-        )
+        target_ids, safety_label = build_target_ids(self.tokenizer, sample["target_text"])
+        prompt_ids, target_ids = truncate_to_max(prompt_ids, target_ids, self.max_length)
 
         input_ids = prompt_ids + target_ids
-        attention_mask = [1] * len(input_ids)
-        loss_mask = [False] * len(prompt_ids) + target_loss_mask
+        labels = [-100] * len(prompt_ids) + list(target_ids)
 
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "loss_mask": torch.tensor(loss_mask, dtype=torch.bool),
+            "labels": torch.tensor(labels, dtype=torch.long),
             "prompt_length": torch.tensor(len(prompt_ids), dtype=torch.long),
-            "safety_label_id": torch.tensor(
-                SAFETY_LABEL_TO_ID[safety_label],
-                dtype=torch.long,
-            ),
+            "safety_label_id": torch.tensor(SAFETY_LABEL_TO_ID[safety_label], dtype=torch.long),
         }
 
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict:
+        return self._cache[idx]
+
+
+# ---------------------------------------------------------------------------
+# Collators
+# ---------------------------------------------------------------------------
 
 def collate_fn(batch: list[dict], pad_token_id: int) -> dict:
+    """Standard padded collator (no packing)."""
     max_len = max(b["input_ids"].size(0) for b in batch)
 
-    input_ids = []
-    attention_mask = []
-    loss_masks = []
+    input_ids_list = []
+    attention_mask_list = []
+    labels_list = []
     prompt_lengths = []
     safety_label_ids = []
 
     for item in batch:
         pad_len = max_len - item["input_ids"].size(0)
-        input_ids.append(
-            torch.nn.functional.pad(item["input_ids"], (0, pad_len), value=pad_token_id)
+        input_ids_list.append(
+            F.pad(item["input_ids"], (0, pad_len), value=pad_token_id)
         )
-        attention_mask.append(
-            torch.nn.functional.pad(item["attention_mask"], (0, pad_len), value=0)
+        attention_mask_list.append(
+            F.pad(torch.ones(item["input_ids"].size(0), dtype=torch.long), (0, pad_len))
         )
-        loss_masks.append(
-            torch.nn.functional.pad(item["loss_mask"], (0, pad_len), value=False)
+        labels_list.append(
+            F.pad(item["labels"], (0, pad_len), value=-100)
         )
         prompt_lengths.append(item["prompt_length"])
         safety_label_ids.append(item["safety_label_id"])
 
-    input_ids = torch.stack(input_ids)
-    loss_masks = torch.stack(loss_masks)
-    labels = input_ids.masked_fill(~loss_masks, -100)
-
     return {
-        "input_ids": input_ids,
-        "attention_mask": torch.stack(attention_mask),
-        "labels": labels,
+        "input_ids": torch.stack(input_ids_list),
+        "attention_mask": torch.stack(attention_mask_list),
+        "labels": torch.stack(labels_list),
         "prompt_lengths": torch.stack(prompt_lengths),
         "safety_label_ids": torch.stack(safety_label_ids),
     }
 
+
+def _build_block_diagonal_causal_mask(
+    seqlens: list[int],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Build an additive causal block-diagonal attention mask.
+
+    Within each sub-sequence: lower-triangular (0.0 = attend, -inf = blocked).
+    Across sub-sequences: fully blocked (-inf).
+
+    Returns shape (1, 1, total_len, total_len) ready for model forward.
+    """
+    total = sum(seqlens)
+    # Start fully blocked
+    mask = torch.full((total, total), torch.finfo(dtype).min, dtype=dtype, device=device)
+    pos = 0
+    for l in seqlens:
+        # triu(fill(-inf), diagonal=1) gives 0 on+below diagonal, -inf above diagonal
+        causal_block = torch.triu(
+            torch.full((l, l), torch.finfo(dtype).min, dtype=dtype, device=device),
+            diagonal=1,
+        )
+        mask[pos : pos + l, pos : pos + l] = causal_block
+        pos += l
+    return mask.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
+
+
+def packed_collate_fn(batch: list[dict], pad_token_id: int) -> dict:
+    """
+    Packing collator: concatenates examples in each batch item into a single
+    sequence with a 4-D block-diagonal causal attention mask to prevent any
+    cross-example token interaction.
+
+    Each element of `batch` is already one packed item produced by
+    PackingCollator.__call__, i.e. a dict with keys:
+      input_ids, labels, position_ids, seqlens (list[int]), safety_label_ids, prompt_lengths
+    """
+    # Each batch element is already packed; we need to stack them.
+    max_len = max(b["input_ids"].size(0) for b in batch)
+
+    input_ids_list = []
+    labels_list = []
+    position_ids_list = []
+    all_seqlens = []
+    safety_label_ids = []
+    prompt_lengths = []
+
+    for item in batch:
+        pad_len = max_len - item["input_ids"].size(0)
+        input_ids_list.append(F.pad(item["input_ids"], (0, pad_len), value=pad_token_id))
+        labels_list.append(F.pad(item["labels"], (0, pad_len), value=-100))
+        position_ids_list.append(F.pad(item["position_ids"], (0, pad_len), value=0))
+        all_seqlens.append(item["seqlens"])
+        safety_label_ids.extend(item["safety_label_ids"])
+        prompt_lengths.extend(item["prompt_lengths"])
+
+    input_ids = torch.stack(input_ids_list)
+    labels = torch.stack(labels_list)
+    position_ids = torch.stack(position_ids_list)
+
+    # 4-D block-diagonal mask — one per batch item
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+    masks = []
+    for seqlens in all_seqlens:
+        total = sum(seqlens)
+        m = _build_block_diagonal_causal_mask(seqlens, dtype=dtype, device=input_ids.device)
+        # Pad mask spatial dims to max_len
+        if total < max_len:
+            pad = max_len - total
+            m = F.pad(m, (0, pad, 0, pad), value=torch.finfo(dtype).min)
+        masks.append(m)  # (1, 1, max_len, max_len)
+
+    attention_mask_4d = torch.cat(masks, dim=0)  # (B, 1, max_len, max_len)
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask_4d,
+        "labels": labels,
+        "position_ids": position_ids,
+        "prompt_lengths": torch.tensor(prompt_lengths, dtype=torch.long),
+        "safety_label_ids": torch.tensor(safety_label_ids, dtype=torch.long),
+        "packed": True,
+    }
+
+
+class PackingCollator:
+    """
+    Wraps the dataset's raw items.  For each call (list of raw examples),
+    greedily packs them into one sequence and returns a single packed item.
+    Used together with LengthGroupedBatchSampler so the sampler hands over
+    examples that already fit within max_length when concatenated.
+    """
+
+    def __init__(self, dataset: GuardDataset, max_length: int):
+        self.dataset = dataset
+        self.max_length = max_length
+
+    def __call__(self, items: list[dict]) -> dict:
+        input_ids_parts = []
+        labels_parts = []
+        position_ids_parts = []
+        seqlens = []
+        safety_label_ids = []
+        prompt_lengths = []
+
+        for item in items:
+            n = item["input_ids"].size(0)
+            input_ids_parts.append(item["input_ids"])
+            labels_parts.append(item["labels"])
+            position_ids_parts.append(torch.arange(n, dtype=torch.long))
+            seqlens.append(n)
+            safety_label_ids.append(item["safety_label_id"].item())
+            prompt_lengths.append(item["prompt_length"].item())
+
+        return {
+            "input_ids": torch.cat(input_ids_parts),
+            "labels": torch.cat(labels_parts),
+            "position_ids": torch.cat(position_ids_parts),
+            "seqlens": seqlens,
+            "safety_label_ids": safety_label_ids,
+            "prompt_lengths": prompt_lengths,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Samplers
+# ---------------------------------------------------------------------------
+
+class LengthGroupedBatchSampler(BatchSampler):
+    """
+    Groups examples by token length so each batch has similar-length sequences,
+    minimising padding.  For packing mode, each "batch" is a group of examples
+    whose total length fits within max_packed_length.
+    """
+
+    def __init__(
+        self,
+        lengths: list[int],
+        batch_size: int,
+        drop_last: bool = False,
+        shuffle: bool = True,
+        seed: int = 42,
+        max_packed_length: int | None = None,
+    ):
+        self.drop_last = drop_last
+        self._batches: list[list[int]] = []
+
+        sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
+
+        if max_packed_length is not None:
+            # Greedy bin-packing: fill each bin up to max_packed_length
+            current_bin: list[int] = []
+            current_total = 0
+            for idx in sorted_indices:
+                l = lengths[idx]
+                if l > max_packed_length:
+                    continue  # single example too long; skip
+                if current_total + l > max_packed_length and current_bin:
+                    self._batches.append(current_bin)
+                    current_bin = []
+                    current_total = 0
+                current_bin.append(idx)
+                current_total += l
+            if current_bin and (not drop_last or len(current_bin) > 0):
+                self._batches.append(current_bin)
+        else:
+            for i in range(0, len(sorted_indices), batch_size):
+                batch = sorted_indices[i : i + batch_size]
+                if drop_last and len(batch) < batch_size:
+                    continue
+                self._batches.append(batch)
+
+        if shuffle:
+            rng = random.Random(seed)
+            rng.shuffle(self._batches)
+
+    def __iter__(self):
+        yield from self._batches
+
+    def __len__(self) -> int:
+        return len(self._batches)
+
+
+# ---------------------------------------------------------------------------
+# DataLoader builder
+# ---------------------------------------------------------------------------
 
 def build_dataloader(
     data_path: str,
@@ -319,19 +476,49 @@ def build_dataloader(
     num_workers: int = 0,
     include_response_tasks: bool = True,
     drop_last: bool = False,
+    packing: bool = False,
+    template_tokenizer_name: str | None = None,
 ) -> DataLoader:
     dataset = GuardDataset(
         data_path=data_path,
         tokenizer_name=tokenizer_name,
         max_length=max_length,
         include_response_tasks=include_response_tasks,
+        template_tokenizer_name=template_tokenizer_name,
+    )
+    pad_token_id = dataset.tokenizer.pad_token_id
+
+    if packing:
+        packing_collator = PackingCollator(dataset, max_length)
+
+        sampler = LengthGroupedBatchSampler(
+            lengths=dataset._lengths,
+            batch_size=batch_size,  # used only as fallback; packing uses max_packed_length
+            drop_last=drop_last,
+            shuffle=shuffle,
+            max_packed_length=max_length,
+        )
+
+        return DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            collate_fn=lambda items: packed_collate_fn(
+                [packing_collator(items)], pad_token_id
+            ),
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+
+    sampler = LengthGroupedBatchSampler(
+        lengths=dataset._lengths,
+        batch_size=batch_size,
+        drop_last=drop_last,
+        shuffle=shuffle,
     )
     return DataLoader(
         dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        collate_fn=partial(collate_fn, pad_token_id=dataset.tokenizer.pad_token_id),
+        batch_sampler=sampler,
+        collate_fn=partial(collate_fn, pad_token_id=pad_token_id),
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=drop_last,
     )

@@ -221,3 +221,6 @@ tmp-runs-org/
 tmp-grid-runs/
 tmp-runs/
 checkpoints/
+tests/
+datasets/
+memory/

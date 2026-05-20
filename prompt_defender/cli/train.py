@@ -115,6 +115,7 @@ class GenerativeGuardModule(L.LightningModule):
         self.model = PromptGuardGenModel(
             model_name=cfg["model"]["backbone"],
             freeze_backbone=cfg["model"]["freeze_backbone"],
+            attn_implementation=cfg["model"].get("attn_implementation"),
         )
         class_count = len(SAFETY_LABEL_TO_ID)
         self.register_buffer(
@@ -133,19 +134,27 @@ class GenerativeGuardModule(L.LightningModule):
             persistent=False,
         )
 
+    def on_fit_start(self) -> None:
+        if self.trainer.is_global_zero:
+            print(f"[guard] attention backend: {self.model.attn_implementation}")
+            print(f"[guard] model dtype: {next(self.model.parameters()).dtype}")
+
     def forward(self, batch):
         return self.model(
             input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
+            attention_mask=batch.get("attention_mask"),
             labels=batch["labels"],
+            position_ids=batch.get("position_ids"),
         )
 
     def _generative_eval_batch_limit(self) -> int:
         return int(self.cfg["logging"].get("generative_eval_batches", 32))
 
-    def _should_run_generative_eval(self, batch_idx: int) -> bool:
+    def _should_run_generative_eval(self, batch: dict, batch_idx: int) -> bool:
         if self.trainer.sanity_checking:
             return False
+        if batch.get("packed"):
+            return False  # generative eval requires non-packed val batches
 
         batch_limit = self._generative_eval_batch_limit()
         if batch_limit == 0:
@@ -203,7 +212,7 @@ class GenerativeGuardModule(L.LightningModule):
         generated_ids = generated[:, total_input_len:]
 
         pred_texts = []
-        for row_idx, _prompt_length in enumerate(prompt_lengths.tolist()):
+        for row_idx in range(batch_size):
             pred_texts.append(
                 normalize_generated_safety_text(
                     self.model.tokenizer.decode(
@@ -219,16 +228,12 @@ class GenerativeGuardModule(L.LightningModule):
         output = self(batch)
         loss = output.loss
 
-        # Exact-match accuracy over the supervised safety label tokens.
         with torch.no_grad():
             preds = output.logits[:, :-1].argmax(dim=-1)
             target = batch["labels"][:, 1:]
             mask = target != -100
-            valid_rows = mask.any(dim=1)
-            if valid_rows.any():
-                token_match = (~mask) | (preds == target)
-                sample_match = token_match.all(dim=1) & valid_rows
-                acc = sample_match[valid_rows].float().mean()
+            if mask.any():
+                acc = (preds == target)[mask].float().mean()
             else:
                 acc = torch.tensor(0.0, device=loss.device)
 
@@ -266,7 +271,7 @@ class GenerativeGuardModule(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         loss, acc = self._shared_step(batch)
 
-        if self._should_run_generative_eval(batch_idx):
+        if self._should_run_generative_eval(batch, batch_idx):
             pred_texts = self._generate_safety_predictions(batch)
             batch_metrics = compute_metrics(pred_texts, batch["safety_label_ids"])
             self.val_confusion += batch_metrics["confusion"]
@@ -458,9 +463,9 @@ def main():
     parser.add_argument("--num_nodes", type=int, default=1)
     parser.add_argument("--strategy", type=str, default="auto")
     parser.add_argument("--resume", type=str, default=None, help="path to checkpoint")
-    parser.add_argument("--logger", type=str, default="tensorboard", choices=["tensorboard", "wandb"], help="Logger to use")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible runs")
-    parser.add_argument("--skip-auto-export", action="store_true", help="Skip automatic best-checkpoint export to HF format")
+    parser.add_argument("--logger", type=str, default="tensorboard", choices=["tensorboard", "wandb"])
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--skip-auto-export", action="store_true")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -468,36 +473,40 @@ def main():
     distributed_run = is_distributed_run(args)
     train_drop_last = bool(cfg["data"].get("train_drop_last", distributed_run))
     val_drop_last = bool(cfg["data"].get("val_drop_last", False))
+    packing = bool(cfg["data"].get("packing", False))
+    template_tokenizer = cfg["model"].get("template_tokenizer")
 
     if seed is not None:
         L.seed_everything(seed, workers=True)
 
-    # --- dataloaders ---
+    _dl_common = dict(
+        tokenizer_name=cfg["model"]["backbone"],
+        max_length=cfg["data"]["max_length"],
+        num_workers=cfg["output"]["num_workers"],
+        include_response_tasks=cfg["data"].get("include_response_tasks", True),
+        template_tokenizer_name=template_tokenizer,
+    )
+
     train_dl = build_dataloader(
         data_path=cfg["data"]["train_path"],
-        tokenizer_name=cfg["model"]["backbone"],
         batch_size=cfg["training"]["batch_size"],
-        max_length=cfg["data"]["max_length"],
         shuffle=True,
-        num_workers=cfg["output"]["num_workers"],
-        include_response_tasks=cfg["data"].get("include_response_tasks", True),
         drop_last=train_drop_last,
+        packing=packing,
+        **_dl_common,
     )
+    # Val always non-packed so generative eval can extract per-example sequences
     val_dl = build_dataloader(
         data_path=cfg["data"]["val_path"],
-        tokenizer_name=cfg["model"]["backbone"],
         batch_size=cfg["training"]["batch_size"],
-        max_length=cfg["data"]["max_length"],
         shuffle=False,
-        num_workers=cfg["output"]["num_workers"],
-        include_response_tasks=cfg["data"].get("include_response_tasks", True),
         drop_last=val_drop_last,
+        packing=False,
+        **_dl_common,
     )
 
-    # --- model ---
     module = GenerativeGuardModule(cfg)
 
-    # --- callbacks ---
     ckpt_dir = Path(cfg["output"]["dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     experiment_name, experiment_metadata_path, experiment_registry_path = resolve_experiment_name(
@@ -506,6 +515,7 @@ def main():
     )
     logger_logs_root = ckpt_dir / "logs"
     logger_logs_root.mkdir(parents=True, exist_ok=True)
+
     best_ckpt_callback = ModelCheckpoint(
         dirpath=ckpt_dir,
         filename="guard-best-{epoch}-{step}-{val_loss:.4f}",
@@ -529,32 +539,25 @@ def main():
         LearningRateMonitor(logging_interval="step"),
     ]
 
-    # --- strategy ---
     strategy = args.strategy
     if strategy == "ddp":
         strategy = DDPStrategy(find_unused_parameters=False)
-
     elif strategy == "fsdp":
-        strategy = FSDPStrategy(
-            auto_wrap_policy={PromptGuardGenModel},
-        )
+        strategy = FSDPStrategy(auto_wrap_policy={PromptGuardGenModel})
 
-    # --- precision ---
     if cfg["training"]["bf16"]:
         precision = "bf16-mixed"
     elif cfg["training"]["fp16"]:
         precision = "16-mixed"
     else:
         precision = "32-true"
-            
-    # --- logger ---
+
     if args.logger == "wandb":
         try:
             from lightning.pytorch.loggers import WandbLogger
         except ModuleNotFoundError as exc:
             raise ModuleNotFoundError(
-                "wandb logger requested, but wandb is not installed. "
-                "Install wandb or use --logger tensorboard."
+                "wandb logger requested, but wandb is not installed."
             ) from exc
         experiment_logger = WandbLogger(
             project="generative_guard",
@@ -568,7 +571,6 @@ def main():
             version="",
         )
 
-    # --- trainer ---
     trainer = L.Trainer(
         max_epochs=cfg["training"]["epochs"],
         devices=args.devices,
@@ -607,6 +609,8 @@ def main():
         "distributed_run": distributed_run,
         "train_drop_last": train_drop_last,
         "val_drop_last": val_drop_last,
+        "packing": packing,
+        "attn_implementation": cfg["model"].get("attn_implementation"),
         "resume_checkpoint": args.resume,
         "seed": seed,
         "best_checkpoint": best_ckpt_callback.best_model_path or None,
@@ -618,8 +622,7 @@ def main():
     }
     if trainer.is_global_zero:
         save_json(train_summary_path, train_summary)
-    
-    # --- automatic export of the best checkpoint to Hugging Face format ---
+
     if trainer.is_global_zero and not args.skip_auto_export:
         best_ckpt = best_ckpt_callback.best_model_path
         if best_ckpt:
