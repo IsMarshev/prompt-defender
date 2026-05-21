@@ -1,6 +1,6 @@
-model_name_or_path: Qwen/Qwen3-0.6B-Instruct
+model_name_or_path: Qwen/Qwen3-0.6B
 
-train_file: data/train.jsonl
+train_file: ./datasets--Sacrow--Prompt-injections/snapshots/748e90d1d3d2ea1fe8cb9ed606e99d78681a7a64/train-00000-2026-05-20.jsonl
 # val_file: data/val.jsonl   # uncomment to use explicit val file; otherwise 1-2% split is used
 
 output_dir: outputs/

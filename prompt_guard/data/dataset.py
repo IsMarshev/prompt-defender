@@ -1,9 +1,12 @@
 import json
+import os
 import random
 import warnings
 from collections import Counter
 from dataclasses import dataclass
 from typing import Optional
+
+from tqdm import tqdm
 
 import torch
 from torch.utils.data import Dataset, Sampler
@@ -136,12 +139,21 @@ class PromptSafetyDataset(Dataset):
         offset_map: list[tuple[int, str, str]] = []
         all_lengths: list[int] = []
 
+        file_size = os.path.getsize(path)
+        bar = tqdm(
+            total=file_size,
+            unit="B",
+            unit_scale=True,
+            desc=f"Scanning {os.path.basename(path)}",
+            leave=True,
+        )
         with open(path, "rb") as f:
             while True:
                 off = f.tell()
                 raw = f.readline()
                 if not raw:
                     break
+                bar.update(len(raw))
                 s = raw.decode("utf-8").strip()
                 if not s:
                     continue
@@ -151,6 +163,7 @@ class PromptSafetyDataset(Dataset):
                 offset_map.append((off, label, cats))
                 sample = {"user_message": item["instruction"], "label": label, "categories": cats}
                 all_lengths.append(self._token_length(sample))
+        bar.close()
 
         return offset_map, all_lengths
 
@@ -245,19 +258,28 @@ class PromptSafetyDataset(Dataset):
         Intended for eval: small, fixed subset that fits in RAM.
         """
         all_samples: list[dict] = []
-        with open(file_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                item = json.loads(line)
-                label = _normalize_label(item["label"])
-                cats = _normalize_categories(item.get("category", "None"), label)
-                all_samples.append({
-                    "user_message": item["instruction"],
-                    "label": label,
-                    "categories": cats,
-                })
+        file_size = os.path.getsize(file_path)
+        with tqdm(
+            total=file_size,
+            unit="B",
+            unit_scale=True,
+            desc=f"Reading {os.path.basename(file_path)}",
+            leave=True,
+        ) as bar:
+            with open(file_path, "rb") as f:
+                for raw in f:
+                    bar.update(len(raw))
+                    line = raw.decode("utf-8").strip()
+                    if not line:
+                        continue
+                    item = json.loads(line)
+                    label = _normalize_label(item["label"])
+                    cats = _normalize_categories(item.get("category", "None"), label)
+                    all_samples.append({
+                        "user_message": item["instruction"],
+                        "label": label,
+                        "categories": cats,
+                    })
         chosen = random.Random(seed).sample(all_samples, min(n, len(all_samples)))
         return cls.from_samples(chosen, tokenizer, max_length, log_distribution=True)
 
