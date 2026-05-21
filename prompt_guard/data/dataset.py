@@ -6,6 +6,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
 from tqdm import tqdm
 
 import torch
@@ -131,28 +132,26 @@ class PromptSafetyDataset(Dataset):
 
     def _scan(self, path: str) -> tuple[list[tuple[int, str, str]], list[int]]:
         """
-        Single sequential pass over the JSONL file.
-        Returns (offset_map, all_lengths).
-        offset_map[i] = (byte_offset, label, categories)
-        all_lengths[i] = tokenised length of sample i (capped at max_length)
+        Two-phase scan:
+          1. Read JSONL line by line (fast, tqdm by bytes) → build offset map, collect raw texts.
+          2. Batch-tokenise to get lengths (fast tokenizer batch call) → cache to .npy on disk.
+        On subsequent runs phase 2 is replaced by a single numpy load.
         """
+        # ── Phase 1: read lines ──────────────────────────────────────────────
         offset_map: list[tuple[int, str, str]] = []
-        all_lengths: list[int] = []
+        instructions: list[str] = []
+        labels_meta: list[str] = []
+        cats_meta: list[str] = []
 
         file_size = os.path.getsize(path)
-        bar = tqdm(
-            total=file_size,
-            unit="B",
-            unit_scale=True,
-            desc=f"Scanning {os.path.basename(path)}",
-            leave=True,
-        )
-        with open(path, "rb") as f:
-            while True:
-                off = f.tell()
-                raw = f.readline()
-                if not raw:
-                    break
+        byte_offset = 0
+        with tqdm(
+            total=file_size, unit="B", unit_scale=True,
+            desc=f"Reading  {os.path.basename(path)}", leave=True,
+        ) as bar, open(path, "rb") as f:
+            for raw in f:
+                off = byte_offset
+                byte_offset += len(raw)
                 bar.update(len(raw))
                 s = raw.decode("utf-8").strip()
                 if not s:
@@ -161,11 +160,53 @@ class PromptSafetyDataset(Dataset):
                 label = _normalize_label(item["label"])
                 cats = _normalize_categories(item.get("category", "None"), label)
                 offset_map.append((off, label, cats))
-                sample = {"user_message": item["instruction"], "label": label, "categories": cats}
-                all_lengths.append(self._token_length(sample))
-        bar.close()
+                instructions.append(item["instruction"])
+                labels_meta.append(label)
+                cats_meta.append(cats)
+
+        # ── Phase 2: lengths (cached) ────────────────────────────────────────
+        cache = path + ".lengths.npy"
+        if os.path.exists(cache) and os.path.getmtime(cache) >= os.path.getmtime(path):
+            all_lengths = np.load(cache).tolist()
+            print(f"Lengths loaded from cache ({len(all_lengths)} samples).")
+        else:
+            all_lengths = self._batch_tokenize_lengths(instructions, labels_meta, cats_meta)
+            try:
+                np.save(cache, np.array(all_lengths, dtype=np.int32))
+            except OSError:
+                pass  # read-only filesystem — skip cache write
 
         return offset_map, all_lengths
+
+    def _batch_tokenize_lengths(
+        self,
+        instructions: list[str],
+        labels: list[str],
+        cats: list[str],
+        batch_size: int = 512,
+    ) -> list[int]:
+        """Batch-encode prompts+targets; much faster than N individual encode() calls."""
+        has_eos = self.tokenizer.eos_token_id is not None
+        lengths: list[int] = []
+
+        for i in tqdm(
+            range(0, len(instructions), batch_size),
+            desc="Tokenising",
+            unit="batch",
+            leave=True,
+        ):
+            sl = slice(i, i + batch_size)
+            prompts = [_prompt_text(self.tokenizer, instr) for instr in instructions[sl]]
+            targets = [_build_target(lbl, cat) for lbl, cat in zip(labels[sl], cats[sl])]
+
+            p_ids = self.tokenizer(prompts, add_special_tokens=False)["input_ids"]
+            t_ids = self.tokenizer(targets, add_special_tokens=False)["input_ids"]
+
+            for pi, ti in zip(p_ids, t_ids):
+                n = len(pi) + len(ti) + (1 if has_eos else 0)
+                lengths.append(min(n, self.max_length))
+
+        return lengths
 
     def _token_length(self, sample: dict) -> int:
         prompt = _prompt_text(self.tokenizer, sample["user_message"])

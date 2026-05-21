@@ -4,6 +4,7 @@ datasets
 peft
 accelerate
 scikit-learn
+numpy
 pyyaml
 tqdm
 wandb
