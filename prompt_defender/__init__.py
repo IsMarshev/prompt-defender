@@ -1,1 +1,0 @@
-"""Prompt Defender package."""

@@ -1,7 +1,9 @@
-lightning==2.5.6
-tensorboard==2.20.0
-torch==2.4.0
-transformers==4.51.3
-tqdm
+torch>=2.0
+transformers>=4.40
+datasets
+peft
+accelerate
+scikit-learn
 pyyaml
+tqdm
 wandb
