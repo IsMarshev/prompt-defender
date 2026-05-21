@@ -87,62 +87,127 @@ def _prompt_text(tokenizer: PreTrainedTokenizerBase, user_message: str) -> str:
 # ---------------------------------------------------------------------------
 
 class PromptSafetyDataset(Dataset):
+    """
+    File-backed dataset with lazy per-sample loading.
+
+    Stores only a byte-offset map in memory; full text is read from disk on
+    __getitem__. Lengths are computed in a single scan pass so PackedBatchSampler
+    never waits for a second tokenisation pass.
+
+    For small in-memory datasets (eval subsets) use PromptSafetyDataset.from_samples().
+    """
+
     def __init__(
         self,
         file_path: str,
         tokenizer: PreTrainedTokenizerBase,
         max_length: int = 2048,
         log_distribution: bool = True,
+        indices: Optional[list[int]] = None,
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.samples = self._load(file_path)
+        self._file_path = file_path
+        self._samples: Optional[list[dict]] = None  # None → lazy file mode
+
+        # Single pass: build offset map and compute all lengths
+        self._offset_map, self._all_lengths = self._scan(file_path)
+
+        # Active file-line indices (default: all)
+        self._active = indices if indices is not None else list(range(len(self._offset_map)))
+
+        # Lengths for the active subset — no extra disk reads needed
+        self.lengths = [self._all_lengths[i] for i in self._active]
 
         if log_distribution:
             self._log_distribution()
 
-        # Precompute token lengths for PackedBatchSampler (one tokenise pass per sample).
-        self.lengths = [self._token_length(s) for s in self.samples]
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-    def _load(self, path: str) -> list[dict]:
-        raw = []
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
+    def _scan(self, path: str) -> tuple[list[tuple[int, str, str]], list[int]]:
+        """
+        Single sequential pass over the JSONL file.
+        Returns (offset_map, all_lengths).
+        offset_map[i] = (byte_offset, label, categories)
+        all_lengths[i] = tokenised length of sample i (capped at max_length)
+        """
+        offset_map: list[tuple[int, str, str]] = []
+        all_lengths: list[int] = []
+
+        with open(path, "rb") as f:
+            while True:
+                off = f.tell()
+                raw = f.readline()
+                if not raw:
+                    break
+                s = raw.decode("utf-8").strip()
+                if not s:
                     continue
-                raw.append(json.loads(line))
+                item = json.loads(s)
+                label = _normalize_label(item["label"])
+                cats = _normalize_categories(item.get("category", "None"), label)
+                offset_map.append((off, label, cats))
+                sample = {"user_message": item["instruction"], "label": label, "categories": cats}
+                all_lengths.append(self._token_length(sample))
 
-        samples = []
-        for item in raw:
-            label = _normalize_label(item["label"])
-            categories = _normalize_categories(item.get("category", "None"), label)
-            samples.append(
-                {
-                    "user_message": item["instruction"],
-                    "label": label,
-                    "categories": categories,
-                }
-            )
-        return samples
-
-    def _log_distribution(self):
-        counts = Counter(s["label"] for s in self.samples)
-        total = len(self.samples)
-        print(f"Dataset distribution (total={total}):")
-        for label in ("Safe", "Unsafe", "Controversial"):
-            n = counts.get(label, 0)
-            print(f"  {label}: {n} ({100 * n / total:.1f}%)")
+        return offset_map, all_lengths
 
     def _token_length(self, sample: dict) -> int:
         prompt = _prompt_text(self.tokenizer, sample["user_message"])
         target = _build_target(sample["label"], sample["categories"])
-        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
-        target_ids = self.tokenizer.encode(target, add_special_tokens=False)
-        total = len(prompt_ids) + len(target_ids)
+        n = len(self.tokenizer.encode(prompt, add_special_tokens=False))
+        n += len(self.tokenizer.encode(target, add_special_tokens=False))
         if self.tokenizer.eos_token_id is not None:
-            total += 1
-        return min(total, self.max_length)
+            n += 1
+        return min(n, self.max_length)
+
+    def _read_file_sample(self, file_idx: int) -> dict:
+        """Read and return sample dict by absolute file-line index."""
+        off, label, cats = self._offset_map[file_idx]
+        with open(self._file_path, "rb") as f:
+            f.seek(off)
+            item = json.loads(f.readline().decode("utf-8"))
+        return {"user_message": item["instruction"], "label": label, "categories": cats}
+
+    def _get_sample(self, local_idx: int) -> dict:
+        if self._samples is not None:
+            return self._samples[local_idx]
+        return self._read_file_sample(self._active[local_idx])
+
+    def _log_distribution(self) -> None:
+        if self._samples is not None:
+            labels = [s["label"] for s in self._samples]
+        else:
+            labels = [self._offset_map[i][1] for i in self._active]
+        counts = Counter(labels)
+        total = len(labels)
+        print(f"Dataset distribution (total={total}):")
+        for lbl in ("Safe", "Unsafe", "Controversial"):
+            n = counts.get(lbl, 0)
+            print(f"  {lbl}: {n} ({100 * n / total:.1f}%)")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def with_indices(self, indices: list[int]) -> "PromptSafetyDataset":
+        """
+        Return a new lazy dataset restricted to the given file-line indices,
+        reusing the already-scanned offset map (no re-scan of the file).
+        """
+        obj = PromptSafetyDataset.__new__(PromptSafetyDataset)
+        obj.tokenizer = self.tokenizer
+        obj.max_length = self.max_length
+        obj._file_path = self._file_path
+        obj._samples = None
+        obj._offset_map = self._offset_map      # shared — no copy
+        obj._all_lengths = self._all_lengths    # shared — no copy
+        obj._active = indices
+        obj.lengths = [self._all_lengths[i] for i in indices]
+        obj._log_distribution()
+        return obj
 
     @classmethod
     def from_samples(
@@ -152,26 +217,60 @@ class PromptSafetyDataset(Dataset):
         max_length: int = 2048,
         log_distribution: bool = True,
     ) -> "PromptSafetyDataset":
-        """Construct a dataset from an already-loaded sample list (no JSONL file needed)."""
+        """Construct a fully in-memory dataset from an already-loaded sample list."""
         obj = cls.__new__(cls)
         obj.tokenizer = tokenizer
         obj.max_length = max_length
-        obj.samples = samples
+        obj._file_path = None
+        obj._offset_map = []
+        obj._all_lengths = []
+        obj._active = []
+        obj._samples = samples
         obj.lengths = [obj._token_length(s) for s in samples]
         if log_distribution:
             obj._log_distribution()
         return obj
 
+    @classmethod
+    def random_eval_subset(
+        cls,
+        file_path: str,
+        tokenizer: PreTrainedTokenizerBase,
+        n: int = 128,
+        seed: int = 0,
+        max_length: int = 2048,
+    ) -> "PromptSafetyDataset":
+        """
+        Load n random samples from a JSONL file fully into memory.
+        Intended for eval: small, fixed subset that fits in RAM.
+        """
+        all_samples: list[dict] = []
+        with open(file_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                label = _normalize_label(item["label"])
+                cats = _normalize_categories(item.get("category", "None"), label)
+                all_samples.append({
+                    "user_message": item["instruction"],
+                    "label": label,
+                    "categories": cats,
+                })
+        chosen = random.Random(seed).sample(all_samples, min(n, len(all_samples)))
+        return cls.from_samples(chosen, tokenizer, max_length, log_distribution=True)
+
     def set_samples(self, samples: list[dict]) -> None:
-        """Replace samples in-place and recompute precomputed lengths."""
-        self.samples = samples
+        """Replace in-memory samples and recompute lengths (in-memory datasets only)."""
+        self._samples = samples
         self.lengths = [self._token_length(s) for s in samples]
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self._samples) if self._samples is not None else len(self._active)
 
     def __getitem__(self, idx: int) -> dict:
-        sample = self.samples[idx]
+        sample = self._get_sample(idx)
         prompt = _prompt_text(self.tokenizer, sample["user_message"])
         target = _build_target(sample["label"], sample["categories"])
 
@@ -199,7 +298,7 @@ class PromptSafetyDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Eval collator (standard padding, used by Trainer's eval dataloader)
+# Eval collator (standard padding, used for eval dataloader)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -280,11 +379,7 @@ class PackedBatchSampler(Sampler):
         current_len = 0
 
         for idx in indices:
-            sample_len = self.lengths[idx]
-            if sample_len > self.max_length:
-                # Already truncated by dataset, but be defensive.
-                sample_len = self.max_length
-
+            sample_len = min(self.lengths[idx], self.max_length)
             if current_len + sample_len <= self.max_length:
                 current.append(idx)
                 current_len += sample_len
@@ -323,7 +418,6 @@ class PackedBatchSampler(Sampler):
                 f"({total_real:,} / {total_cap:,} tokens)"
             )
 
-        # Invalidate so the next epoch's set_epoch call starts clean.
         self._cached_bins = None
 
 
@@ -341,17 +435,15 @@ class PackedDataCollator:
         all_input_ids: list[torch.Tensor] = []
         all_labels: list[torch.Tensor] = []
         all_position_ids: list[torch.Tensor] = []
-        # cu_seqlens[k] = start token index of sample k in the packed sequence
         cu_seqlens: list[int] = [0]
 
         for feat in features:
-            ids = feat["input_ids"]   # (L,)
-            labs = feat["labels"]     # (L,)
+            ids = feat["input_ids"]
+            labs = feat["labels"]
             L = ids.size(0)
 
             all_input_ids.append(ids)
             all_labels.append(labs)
-            # Position ids restart from 0 for every sample in the pack.
             all_position_ids.append(torch.arange(L, dtype=torch.long))
             cu_seqlens.append(cu_seqlens[-1] + L)
 
@@ -360,7 +452,6 @@ class PackedDataCollator:
         position_ids = torch.cat(all_position_ids)
         total_len = input_ids.size(0)
 
-        # Pad to max_length
         pad_len = self.max_length - total_len
         if pad_len > 0:
             pad_id = self.tokenizer.pad_token_id or 0
@@ -370,16 +461,13 @@ class PackedDataCollator:
             labels = torch.cat(
                 [labels, torch.full((pad_len,), -100, dtype=torch.long)]
             )
-            # Position ids for padding: continue monotonically (values don't matter,
-            # padding outputs are ignored, but must stay in-range for the embedding table).
             position_ids = torch.cat(
                 [position_ids, torch.arange(pad_len, dtype=torch.long)]
             )
 
-        # Add batch dimension (batch_size = 1 per packed sequence).
-        input_ids = input_ids.unsqueeze(0)       # (1, max_length)
-        labels = labels.unsqueeze(0)             # (1, max_length)
-        position_ids = position_ids.unsqueeze(0) # (1, max_length)
+        input_ids = input_ids.unsqueeze(0)
+        labels = labels.unsqueeze(0)
+        position_ids = position_ids.unsqueeze(0)
 
         result: dict[str, torch.Tensor] = {
             "input_ids": input_ids,
@@ -388,9 +476,7 @@ class PackedDataCollator:
         }
 
         if not self.use_fa2:
-            result["attention_mask"] = self._build_block_diagonal_mask(
-                cu_seqlens, total_len
-            )
+            result["attention_mask"] = self._build_block_diagonal_mask(cu_seqlens, total_len)
 
         return result
 
@@ -398,15 +484,12 @@ class PackedDataCollator:
         self, cu_seqlens: list[int], total_len: int
     ) -> torch.Tensor:
         T = self.max_length
-        # Additive bias: 0.0 = attend, -inf = block.
-        # Initialise everything to blocked; we'll open up intra-sample causal windows.
         mask = torch.full((T, T), float("-inf"))
 
         for s in range(len(cu_seqlens) - 1):
             start = cu_seqlens[s]
             end = cu_seqlens[s + 1]
             block_size = end - start
-            # Lower-triangular (including diagonal) → 0, upper → -inf.
             upper = torch.triu(
                 torch.ones(block_size, block_size, dtype=torch.bool), diagonal=1
             )
@@ -414,10 +497,7 @@ class PackedDataCollator:
             block[upper] = float("-inf")
             mask[start:end, start:end] = block
 
-        # Padding positions must not produce -inf in every column (NaN in softmax).
-        # Allow them to attend to the first real token; their outputs are masked by labels=-100.
         if total_len < T:
             mask[total_len:, 0] = 0.0
 
-        # Shape: (1, 1, T, T) — broadcast over batch and heads.
         return mask.unsqueeze(0).unsqueeze(0)

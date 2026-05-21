@@ -1,15 +1,21 @@
+import os
 from typing import Optional
 
 import numpy as np
-import wandb
+import torch
+import lightning as L
+from lightning.pytorch.callbacks import (
+    EarlyStopping,
+    LearningRateMonitor,
+    ModelCheckpoint,
+)
+from lightning.pytorch.loggers import WandbLogger
 from sklearn.metrics import f1_score, precision_score, recall_score
 from torch.utils.data import DataLoader
 from transformers import (
-    EarlyStoppingCallback,
     PreTrainedModel,
     PreTrainedTokenizerBase,
-    Trainer,
-    TrainingArguments,
+    get_cosine_schedule_with_warmup,
 )
 from transformers.trainer_utils import EvalPrediction
 
@@ -104,8 +110,8 @@ def verify_packed_batches(
         samples = [dataset[i] for i in bin_indices]
         batch = collator(samples)
 
-        labels = batch["labels"][0]          # (max_length,)
-        position_ids = batch["position_ids"][0]  # (max_length,)
+        labels = batch["labels"][0]
+        position_ids = batch["position_ids"][0]
         n_real = sum(dataset.lengths[i] for i in bin_indices)
         n_label_tokens = (labels != -100).sum().item()
 
@@ -117,31 +123,20 @@ def verify_packed_batches(
         )
         print(f"    Non-(-100) labels:    {n_label_tokens}")
 
-        # Verify position_ids restart from 0 at each sample boundary.
         cumlen = 0
         ok = True
-        for k, idx in enumerate(bin_indices):
-            start_pos = position_ids[cumlen].item()
-            if start_pos != 0:
+        for idx in bin_indices:
+            if position_ids[cumlen].item() != 0:
                 ok = False
             cumlen += dataset.lengths[idx]
 
         print(f"    Position IDs restart: {'OK' if ok else 'FAIL'}")
-        if not ok:
-            cumlen = 0
-            for k, idx in enumerate(bin_indices):
-                print(
-                    f"      sample[{k}] offset={cumlen} "
-                    f"pos[offset]={position_ids[cumlen].item()}"
-                )
-                cumlen += dataset.lengths[idx]
 
         if "attention_mask" in batch:
-            mask = batch["attention_mask"][0, 0]  # (T, T)
+            mask = batch["attention_mask"][0, 0]
             size = min(8, mask.shape[0])
             print(f"    Attention mask [{size}x{size} top-left slice]:")
-            slice_str = mask[:size, :size].cpu()
-            for row in slice_str:
+            for row in mask[:size, :size].cpu():
                 print("      " + "  ".join(
                     "  0" if v == 0.0 else "-inf" for v in row.tolist()
                 ))
@@ -150,125 +145,179 @@ def verify_packed_batches(
 
 
 # ---------------------------------------------------------------------------
-# Training arguments
+# Lightning module
 # ---------------------------------------------------------------------------
 
-def build_training_args(cfg: dict) -> TrainingArguments:
-    report_to = "wandb" if cfg.get("use_wandb", False) else "none"
-
-    return TrainingArguments(
-        output_dir=cfg["output_dir"],
-        num_train_epochs=cfg.get("num_train_epochs", 3),
-        # With packed batches each DataLoader item is one full packed sequence;
-        # batching is controlled by PackedBatchSampler, not Trainer.
-        per_device_train_batch_size=1,
-        per_device_eval_batch_size=cfg.get("per_device_eval_batch_size", 4),
-        gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 16),
-        learning_rate=float(cfg.get("learning_rate", 2e-5)),
-        lr_scheduler_type=cfg.get("lr_scheduler_type", "cosine"),
-        warmup_ratio=cfg.get("warmup_ratio", 0.05),
-        weight_decay=cfg.get("weight_decay", 0.01),
-        max_grad_norm=cfg.get("max_grad_norm", 1.0),
-        bf16=cfg.get("bf16", True),
-        logging_steps=cfg.get("logging_steps", 10),
-        eval_strategy=cfg.get("eval_strategy", "steps"),
-        eval_steps=cfg.get("eval_steps", 500),
-        save_strategy=cfg.get("save_strategy", "steps"),
-        save_steps=cfg.get("save_steps", 500),
-        load_best_model_at_end=cfg.get("load_best_model_at_end", True),
-        metric_for_best_model=cfg.get("metric_for_best_model", "f1"),
-        greater_is_better=True,
-        seed=cfg.get("seed", 42),
-        report_to=report_to,
-        save_total_limit=3,
-        dataloader_num_workers=cfg.get("dataloader_num_workers", 0),
-        remove_unused_columns=False,
-        predict_with_generate=False,
-        include_inputs_for_metrics=False,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Trainer subclass that injects the packed train DataLoader
-# ---------------------------------------------------------------------------
-
-class PackedTrainer(Trainer):
+class PromptSafetyModule(L.LightningModule):
     def __init__(
         self,
-        *args,
-        packed_sampler: PackedBatchSampler,
-        packed_collator: PackedDataCollator,
-        **kwargs,
+        model: PreTrainedModel,
+        tokenizer: PreTrainedTokenizerBase,
+        train_dataset: PromptSafetyDataset,
+        val_dataset: Optional[PromptSafetyDataset],
+        cfg: dict,
+        use_fa2: bool = False,
     ):
-        super().__init__(*args, **kwargs)
-        self._packed_sampler = packed_sampler
-        self._packed_collator = packed_collator
+        super().__init__()
+        self.model = model
+        self.tokenizer = tokenizer
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.cfg = cfg
+        self.use_fa2 = use_fa2
+        self._val_outputs: list[dict] = []
+        self._packed_sampler: Optional[PackedBatchSampler] = None
 
-    def get_train_dataloader(self) -> DataLoader:
-        # Trainer's internal _inner_training_loop calls
-        # batch_sampler.set_epoch(epoch) automatically when the attribute exists.
+    def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
+        loss = self.model(**batch).loss
+        self.log("train/loss", loss, on_step=True, on_epoch=False, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch: dict, batch_idx: int) -> None:
+        with torch.no_grad():
+            outputs = self.model(**batch)
+        self._val_outputs.append({
+            "loss": outputs.loss.detach().cpu(),
+            "logits": outputs.logits.detach().cpu(),
+            "labels": batch["labels"].detach().cpu(),
+        })
+
+    def on_validation_epoch_end(self) -> None:
+        if not self._val_outputs:
+            return
+
+        avg_loss = torch.stack([o["loss"] for o in self._val_outputs]).mean()
+        self.log("val/loss", avg_loss, prog_bar=True, sync_dist=True)
+
+        preds = torch.cat([o["logits"].argmax(-1) for o in self._val_outputs]).numpy()
+        labels = torch.cat([o["labels"] for o in self._val_outputs]).numpy()
+
+        metrics = build_compute_metrics(self.tokenizer)(
+            EvalPrediction(predictions=preds, label_ids=labels)
+        )
+        self.log_dict(
+            {f"val/{k}": v for k, v in metrics.items()},
+            prog_bar=True,
+            sync_dist=True,
+        )
+        self._val_outputs.clear()
+
+    def on_train_epoch_start(self) -> None:
+        if self._packed_sampler is not None:
+            self._packed_sampler.set_epoch(self.current_epoch)
+
+    def train_dataloader(self) -> DataLoader:
+        max_length = self.cfg.get("max_length", 2048)
+        self._packed_sampler = PackedBatchSampler(
+            self.train_dataset,
+            max_length=max_length,
+            shuffle=True,
+            seed=self.cfg.get("seed", 42),
+        )
+        packed_collator = PackedDataCollator(
+            tokenizer=self.tokenizer,
+            max_length=max_length,
+            use_fa2=self.use_fa2,
+        )
         return DataLoader(
             self.train_dataset,
             batch_sampler=self._packed_sampler,
-            collate_fn=self._packed_collator,
-            num_workers=self.args.dataloader_num_workers,
-            pin_memory=self.args.dataloader_pin_memory,
+            collate_fn=packed_collator,
+            num_workers=self.cfg.get("dataloader_num_workers", 0),
+            pin_memory=True,
         )
 
+    def val_dataloader(self) -> DataLoader:
+        eval_collator = DataCollatorForSafety(self.tokenizer, pad_to_multiple_of=8)
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.cfg.get("per_device_eval_batch_size", 4),
+            collate_fn=eval_collator,
+            shuffle=False,
+            num_workers=self.cfg.get("dataloader_num_workers", 0),
+        )
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=float(self.cfg.get("learning_rate", 2e-5)),
+            weight_decay=float(self.cfg.get("weight_decay", 0.01)),
+            eps=1e-8,
+        )
+
+        max_length = self.cfg.get("max_length", 2048)
+        grad_accum = self.cfg.get("gradient_accumulation_steps", 16)
+        num_epochs = self.cfg.get("num_train_epochs", 3)
+
+        # Estimate number of optimizer steps for the LR scheduler
+        est_sampler = PackedBatchSampler(
+            self.train_dataset, max_length=max_length, shuffle=False
+        )
+        steps_per_epoch = max(1, len(est_sampler) // grad_accum)
+        total_steps = steps_per_epoch * num_epochs
+        warmup_steps = max(1, int(total_steps * self.cfg.get("warmup_ratio", 0.05)))
+
+        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
+        }
+
 
 # ---------------------------------------------------------------------------
-# Entry-point
+# Trainer factory
 # ---------------------------------------------------------------------------
 
-def run_sft(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizerBase,
-    train_dataset: PromptSafetyDataset,
-    val_dataset: Optional[PromptSafetyDataset],
+def build_lightning_trainer(
     cfg: dict,
-    use_fa2: bool = False,
     use_wandb: bool = False,
-) -> PackedTrainer:
+    has_val: bool = True,
+) -> L.Trainer:
+    callbacks: list = [LearningRateMonitor(logging_interval="step")]
+
+    if has_val:
+        callbacks += [
+            ModelCheckpoint(
+                dirpath=os.path.join(cfg["output_dir"], "checkpoints"),
+                monitor="val/f1",
+                mode="max",
+                save_top_k=cfg.get("save_total_limit", 3),
+                filename="epoch={epoch}-step={step}-f1={val/f1:.4f}",
+                save_last=True,
+            ),
+            EarlyStopping(
+                monitor="val/f1",
+                patience=cfg.get("early_stopping_patience", 3),
+                mode="max",
+            ),
+        ]
+    else:
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=os.path.join(cfg["output_dir"], "checkpoints"),
+                save_last=True,
+                every_n_train_steps=cfg.get("save_steps", 500),
+            )
+        )
+
     if use_wandb:
-        wandb.init(
+        logger = WandbLogger(
             project=cfg.get("wandb_project", "prompt-defender"),
             name=cfg.get("wandb_run_name", None),
             config=cfg,
         )
+    else:
+        logger = True  # default TensorBoard logger
 
-    cfg["use_wandb"] = use_wandb
-    max_length = cfg.get("max_length", 2048)
-
-    packed_sampler = PackedBatchSampler(
-        dataset=train_dataset,
-        max_length=max_length,
-        shuffle=True,
-        seed=cfg.get("seed", 42),
-    )
-    packed_collator = PackedDataCollator(
-        tokenizer=tokenizer,
-        max_length=max_length,
-        use_fa2=use_fa2,
-    )
-    # Standard padding collator for eval (Trainer's default get_eval_dataloader uses this).
-    eval_collator = DataCollatorForSafety(tokenizer=tokenizer, pad_to_multiple_of=8)
-
-    training_args = build_training_args(cfg)
-
-    callbacks = []
-    if cfg.get("load_best_model_at_end", True) and val_dataset is not None:
-        callbacks.append(EarlyStoppingCallback(early_stopping_patience=3))
-
-    trainer = PackedTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        data_collator=eval_collator,
-        packed_sampler=packed_sampler,
-        packed_collator=packed_collator,
-        compute_metrics=build_compute_metrics(tokenizer) if val_dataset else None,
+    return L.Trainer(
+        max_epochs=cfg.get("num_train_epochs", 3),
+        precision="bf16-mixed" if cfg.get("bf16", True) else "32-true",
+        accumulate_grad_batches=cfg.get("gradient_accumulation_steps", 16),
+        gradient_clip_val=cfg.get("max_grad_norm", 1.0),
+        log_every_n_steps=cfg.get("logging_steps", 10),
+        val_check_interval=cfg.get("eval_steps", 500) if has_val else 1.0,
         callbacks=callbacks,
+        logger=logger,
+        enable_progress_bar=True,
+        default_root_dir=cfg["output_dir"],
     )
-
-    return trainer
