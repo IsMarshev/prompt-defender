@@ -198,8 +198,9 @@ class PromptSafetyModule(L.LightningModule):
         y_true: list[int] = []
         y_pred: list[int] = []
         for o in self._val_outputs:
-            pred_ids = o["logits"].argmax(-1)  # (B, T)
-            label_ids = o["labels"]            # (B, T)
+            # logits[i] predicts token at position i+1, so shift by 1 to align with labels
+            pred_ids = o["logits"][:, :-1, :].argmax(-1)  # (B, T-1)
+            label_ids = o["labels"][:, 1:]                 # (B, T-1)
             for pred_row, label_row in zip(pred_ids, label_ids):
                 mask = label_row != -100
                 pred_text = self.tokenizer.decode(
@@ -265,6 +266,7 @@ class PromptSafetyModule(L.LightningModule):
             self.model.parameters(),
             lr=float(self.cfg.get("learning_rate", 2e-5)),
             weight_decay=float(self.cfg.get("weight_decay", 0.01)),
+            betas=[0.92,0.98],
             eps=1e-8,
         )
 
