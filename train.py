@@ -91,7 +91,7 @@ def main() -> None:
     )
     print(f"Loading model: {cfg['model_name_or_path']}")
     model, tokenizer, use_fa2 = load_model_and_tokenizer(model_cfg)
-
+    model.train()
     max_length = cfg.get("max_length", 2048)
     eval_n = cfg.get("eval_subset_size", 128)
 

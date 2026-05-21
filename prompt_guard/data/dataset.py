@@ -165,7 +165,10 @@ class PromptSafetyDataset(Dataset):
                 cats_meta.append(cats)
 
         # ── Phase 2: lengths (cached) ────────────────────────────────────────
-        cache = path + ".lengths.npy"
+        # Cache key includes tokenizer identity and max_length so that changing
+        # either (e.g. adding enable_thinking=False) busts the cache automatically.
+        tok_tag = (getattr(self.tokenizer, "name_or_path", None) or "unknown").replace("/", "_")
+        cache = f"{path}.lengths.{tok_tag}.{self.max_length}.npy"
         if os.path.exists(cache) and os.path.getmtime(cache) >= os.path.getmtime(path):
             all_lengths = np.load(cache).tolist()
             print(f"Lengths loaded from cache ({len(all_lengths)} samples).")
@@ -515,6 +518,13 @@ class PackedDataCollator:
         position_ids = torch.cat(all_position_ids)
         total_len = input_ids.size(0)
 
+        # Guard: if cached lengths were stale, actual tokens may exceed max_length.
+        if total_len > self.max_length:
+            input_ids = input_ids[: self.max_length]
+            labels = labels[: self.max_length]
+            position_ids = position_ids[: self.max_length]
+            total_len = self.max_length
+
         pad_len = self.max_length - total_len
         if pad_len > 0:
             pad_id = self.tokenizer.pad_token_id or 0
@@ -551,7 +561,9 @@ class PackedDataCollator:
 
         for s in range(len(cu_seqlens) - 1):
             start = cu_seqlens[s]
-            end = cu_seqlens[s + 1]
+            if start >= T:
+                break
+            end = min(cu_seqlens[s + 1], T)  # clamp to T in case of stale-cache overflow
             block_size = end - start
             upper = torch.triu(
                 torch.ones(block_size, block_size, dtype=torch.bool), diagonal=1
