@@ -17,7 +17,11 @@ from transformers import (
     PreTrainedTokenizerBase,
     get_cosine_schedule_with_warmup,
 )
-from transformers.trainer_utils import EvalPrediction
+from typing import NamedTuple
+
+class EvalPrediction(NamedTuple):
+    predictions: "np.ndarray"
+    label_ids: "np.ndarray"
 
 from prompt_guard.data.dataset import (
     DataCollatorForSafety,
@@ -189,12 +193,31 @@ class PromptSafetyModule(L.LightningModule):
         avg_loss = torch.stack([o["loss"] for o in self._val_outputs]).mean()
         self.log("val/loss", avg_loss, prog_bar=True, sync_dist=True)
 
-        preds = torch.cat([o["logits"].argmax(-1) for o in self._val_outputs]).numpy()
-        labels = torch.cat([o["labels"] for o in self._val_outputs]).numpy()
+        # Decode per sample to avoid seq_len mismatch when batches are padded
+        # to different lengths by DataCollatorForSafety.
+        y_true: list[int] = []
+        y_pred: list[int] = []
+        for o in self._val_outputs:
+            pred_ids = o["logits"].argmax(-1)  # (B, T)
+            label_ids = o["labels"]            # (B, T)
+            for pred_row, label_row in zip(pred_ids, label_ids):
+                mask = label_row != -100
+                pred_text = self.tokenizer.decode(
+                    pred_row[mask].tolist(), skip_special_tokens=True
+                )
+                label_text = self.tokenizer.decode(
+                    label_row[mask].tolist(), skip_special_tokens=True
+                )
+                pred_label, _ = _parse_output(pred_text)
+                true_label, _ = _parse_output(label_text)
+                y_pred.append(LABEL2ID.get(pred_label, 1))
+                y_true.append(LABEL2ID.get(true_label, 1))
 
-        metrics = build_compute_metrics(self.tokenizer)(
-            EvalPrediction(predictions=preds, label_ids=labels)
-        )
+        metrics = {
+            "f1": f1_score(y_true, y_pred, average="macro", zero_division=0),
+            "precision": precision_score(y_true, y_pred, average="macro", zero_division=0),
+            "recall": recall_score(y_true, y_pred, average="macro", zero_division=0),
+        }
         self.log_dict(
             {f"val/{k}": v for k, v in metrics.items()},
             prog_bar=True,
