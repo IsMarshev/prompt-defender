@@ -1,0 +1,35 @@
+model_name_or_path: Qwen/Qwen3-0.6B
+
+train_file: ./datasets--Sacrow--Prompt-injections/snapshots/cfac3d6657a4f099ef009e2ba0eabf8dbcbdff94/train-00000-2026-05-20.jsonl
+val_file: ./datasets--Sacrow--Prompt-injections/snapshots/cfac3d6657a4f099ef009e2ba0eabf8dbcbdff94/validation-00000-2026-05-20.jsonl   # uncomment to use explicit val file; otherwise 1-2% split is used
+
+
+output_dir: outputs/
+
+num_train_epochs: 3
+per_device_train_batch_size: 4
+per_device_eval_batch_size: 4
+gradient_accumulation_steps: 16 
+learning_rate: 3e-5
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+weight_decay: 0.01
+max_grad_norm: 1.0
+bf16: true
+
+logging_steps: 10
+eval_strategy: steps
+eval_steps: 1000
+save_strategy: steps
+save_steps: 2000
+load_best_model_at_end: true
+metric_for_best_model: f1
+
+max_length: 4096
+use_lora: false
+
+seed: 42
+
+val_split_ratio: 0.02   
+
+wandb_project: prompt-defender

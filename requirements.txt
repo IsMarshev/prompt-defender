@@ -1,0 +1,11 @@
+torch>=2.0
+transformers>=4.40
+datasets
+peft
+accelerate
+scikit-learn
+numpy
+pyyaml
+tqdm
+wandb
+lightning>=2.0

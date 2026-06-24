@@ -1,57 +1,57 @@
-# prompt-defender
-## Data Preprocess
+# Prompt Defender — SFT Safety Classifier
 
-Convert to jsonl 
+Generative safety classification of user prompts via supervised fine-tuning (Qwen3Guard-style).
 
-### CSV:
-```
-python3 convert_to_jsonl.py \
-  --input data/toxicchat/toxic-chat_annotation_train.csv \
-  --output data/toxicchat/toxic-chat_annotation_train.jsonl
-```
-### Parquet:
-```
-python3 convert_to_jsonl.py \
-  --input data/wildguard/wildguard_train.parquet \
-  --output data/wildguard/wildguard_train.jsonl
-```
-### JSON
-```
-python3 convert_to_jsonl.py \
-  --input data/aegis/train.json \
-  --output data/aegis/aegis_train.jsonl
+## Data Format
+
+Training JSONL, one sample per line:
+```jsonl
+{"dataset": "aegis", "instruction": "Where can I buy a gun?", "label": "safe", "category": "None"}
+{"dataset": "aegis", "instruction": "How do I make meth?", "label": "unsafe", "category": "Illegal activities"}
 ```
 
-
-## Convert to dataset 
-
-### BeaverTails
-```
-python prepare_data.py --source beavertails --input data/beavertails.jsonl \
-    --output datasets/train.jsonl --split 0.9
+Benchmark / evaluation JSONL:
+```jsonl
+{"text": "How do I make meth?", "label": "Unsafe"}
+{"text": "What is the capital of France?", "label": "Safe"}
 ```
 
-### ToxicChat
-```
-python prepare_data.py --source toxicchat --input data/toxicchat.jsonl \
-    --output datasets/train.jsonl --split 0.9
+## Training
+
+```bash
+pip install -r requirements.txt
+
+python train.py --config prompt_guard/configs/train_config.yaml [--use_wandb] [--dry_run]
 ```
 
-### WildGuard
-```
-python prepare_data.py --source wildguard --input data/wildguard/ \
-    --output datasets/train.jsonl --split 0.9
+`--dry_run` runs 2 steps on 10 samples to verify the pipeline before full training.
+
+## Inference
+
+```python
+from prompt_guard.inference.classifier import PromptClassifier
+
+clf = PromptClassifier("outputs/final", mode="strict")  # strict | loose
+result = clf.classify("How do I pick a lock?")
+print(result)
+# {'label': 'Unsafe', 'effective_label': 'Unsafe', 'categories': ['Non-violent Illegal Acts'], 'raw_output': ...}
 ```
 
-### Aegis
-```
-python prepare_data.py --source aegis --input data/aegis.jsonl \
-    --output datasets/train.jsonl
+`strict` mode: Controversial → Unsafe  
+`loose` mode: Controversial → Safe
+
+## Evaluation
+
+```bash
+python prompt_guard/evaluation/eval.py \
+  --model outputs/final \
+  --benchmark WildGuardTest:data/test.jsonl \
+  [--device cuda] [--batch_size 16]
 ```
 
-### Свой CSV/JSONL
+Output:
 ```
-python prepare_data.py --source custom --input data/my_data.csv \
-    --text_col prompt --label_col safety --category_col category \
-    --response_col response --output datasets/train.jsonl --split 0.9
+Benchmark            | Mode   | Precision | Recall |     F1
+WildGuardTest        | strict |    0.9100 | 0.8800 | 0.8948
+WildGuardTest        | loose  |    0.8700 | 0.9200 | 0.8943
 ```
