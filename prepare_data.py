@@ -12,17 +12,14 @@ Converts public safety datasets into the unified JSONL format:
 }
 
 Supported sources:
-    - beavertails   (BeaverTails from PKU)
-    - toxicchat     (ToxicChat)
-    - wildguard     (WildGuardTest / WildGuardMix)
-    - aegis         (Aegis / Aegis2.0)
-    - custom        (generic CSV/JSONL with text + label columns)
+    beavertails, toxicchat, wildguard, aegis, custom (CSV/JSONL)
 
 Usage:
     python prepare_data.py --source beavertails --input data/raw/ --output datasets/train.jsonl
     python prepare_data.py --source custom --input data/my_data.csv --output datasets/train.jsonl \
         --text_col prompt --label_col safety --category_col category
-    python prepare_data.py --source wildguard --input data/wildguard.jsonl --output datasets/train.jsonl --split 0.9
+    python prepare_data.py --source wildguard \
+        --input data/wildguard.jsonl --output datasets/train.jsonl --split 0.9
 """
 
 import argparse
@@ -30,8 +27,6 @@ import csv
 import json
 import random
 from pathlib import Path
-
-# ── Canonical categories ──────────────────────────────────────────────────────
 
 VALID_CATEGORIES = {
     "Violent",
@@ -47,16 +42,12 @@ VALID_CATEGORIES = {
 
 VALID_SAFETY = {"safe", "controversial", "unsafe"}
 
-# ── Category normalization (maps common aliases -> canonical name) ─────────────
-
 _CAT_ALIASES = {
-    # violent
     "violence": "Violent",
     "violent": "Violent",
     "violence_and_physical_harm": "Violent",
     "weapon": "Violent",
     "weapons": "Violent",
-    # non-violent illegal
     "non-violent illegal acts": "Non-violent Illegal Acts",
     "illegal": "Non-violent Illegal Acts",
     "illegal_activity": "Non-violent Illegal Acts",
@@ -65,23 +56,19 @@ _CAT_ALIASES = {
     "drugs": "Non-violent Illegal Acts",
     "fraud": "Non-violent Illegal Acts",
     "theft": "Non-violent Illegal Acts",
-    # sexual
     "sexual": "Sexual Content or Sexual Acts",
     "sexual content": "Sexual Content or Sexual Acts",
     "sexual_content": "Sexual Content or Sexual Acts",
     "sexual content or sexual acts": "Sexual Content or Sexual Acts",
-    # pii
     "pii": "PII",
     "privacy": "PII",
     "personal_information": "PII",
     "personally identifiable information": "PII",
-    # suicide
     "suicide": "Suicide & Self-Harm",
     "self-harm": "Suicide & Self-Harm",
     "self_harm": "Suicide & Self-Harm",
     "suicide & self-harm": "Suicide & Self-Harm",
     "suicide_and_self_harm": "Suicide & Self-Harm",
-    # unethical
     "unethical": "Unethical Acts",
     "unethical acts": "Unethical Acts",
     "hate": "Unethical Acts",
@@ -91,15 +78,12 @@ _CAT_ALIASES = {
     "bias": "Unethical Acts",
     "misinformation": "Unethical Acts",
     "offensive": "Unethical Acts",
-    # political
     "political": "Politically Sensitive Topics",
     "politically sensitive topics": "Politically Sensitive Topics",
     "political_sensitive": "Politically Sensitive Topics",
-    # copyright
     "copyright": "Copyright Violation",
     "copyright violation": "Copyright Violation",
     "copyright_violation": "Copyright Violation",
-    # jailbreak
     "jailbreak": "Jailbreak",
     "prompt_injection": "Jailbreak",
     "prompt injection": "Jailbreak",
@@ -107,13 +91,11 @@ _CAT_ALIASES = {
 
 
 def normalize_category(raw: str | None) -> str:
-    """Map a raw category string to a canonical category name."""
     if not raw or raw.lower().strip() in ("none", "safe", "n/a", ""):
         return "None"
     key = raw.lower().strip()
     if key in _CAT_ALIASES:
         return _CAT_ALIASES[key]
-    # try exact match (case-insensitive)
     for cat in VALID_CATEGORIES:
         if cat.lower() == key:
             return cat
@@ -121,7 +103,6 @@ def normalize_category(raw: str | None) -> str:
 
 
 def normalize_safety(raw: str | None) -> str:
-    """Map a raw safety string to safe|controversial|unsafe."""
     if not raw:
         return "safe"
     val = raw.lower().strip()
@@ -141,7 +122,6 @@ def make_record(
     response_category: str = "None",
     boundary_token: int | None = None,
 ) -> dict:
-    """Build one JSONL record."""
     messages = [{"role": "user", "content": prompt}]
     if response:
         messages.append({"role": "assistant", "content": response})
@@ -155,26 +135,19 @@ def make_record(
     }
 
 
-# ── Source parsers ────────────────────────────────────────────────────────────
-
 def parse_beavertails(path: str) -> list[dict]:
-    """BeaverTails format: JSONL with 'prompt', 'response', 'is_safe', 'category'."""
     records = []
     for line in _iter_jsonl(path):
         prompt = line.get("prompt", "")
         response = line.get("response", "")
-
-        # BeaverTails has per-category boolean dict
         categories = line.get("category", {})
         if isinstance(categories, dict):
             active = [k for k, v in categories.items() if v]
             cat = normalize_category(active[0]) if active else "None"
         else:
             cat = normalize_category(str(categories))
-
         is_safe = line.get("is_safe", True)
         r_safety = "safe" if is_safe else "unsafe"
-
         records.append(make_record(
             prompt=prompt,
             response=response,
@@ -187,7 +160,6 @@ def parse_beavertails(path: str) -> list[dict]:
 
 
 def parse_toxicchat(path: str) -> list[dict]:
-    """ToxicChat format: JSONL with 'user_input', 'model_output', 'toxicity', 'jailbreaking'."""
     records = []
     for line in _iter_jsonl(path):
         prompt = line.get("user_input", "")
@@ -200,7 +172,6 @@ def parse_toxicchat(path: str) -> list[dict]:
             q_safety, q_cat = "unsafe", "Unethical Acts"
         else:
             q_safety, q_cat = "safe", "None"
-
         records.append(make_record(
             prompt=prompt,
             response=response if response else None,
@@ -211,8 +182,6 @@ def parse_toxicchat(path: str) -> list[dict]:
 
 
 def parse_wildguard(path: str) -> list[dict]:
-    """WildGuard format: JSONL with 'prompt', 'response', 'prompt_harm_label',
-    'response_harm_label', 'harm_category', 'response_refusal_label'."""
     records = []
     for line in _iter_jsonl(path):
         prompt = line.get("prompt", "")
@@ -220,7 +189,6 @@ def parse_wildguard(path: str) -> list[dict]:
         q_safety = normalize_safety(line.get("prompt_harm_label", "safe"))
         r_safety = normalize_safety(line.get("response_harm_label", "safe"))
         cat = normalize_category(line.get("harm_category", None))
-
         records.append(make_record(
             prompt=prompt,
             response=response,
@@ -233,14 +201,12 @@ def parse_wildguard(path: str) -> list[dict]:
 
 
 def parse_aegis(path: str) -> list[dict]:
-    """Aegis format: JSONL with 'text'/'prompt', 'label', 'category'."""
     records = []
     for line in _iter_jsonl(path):
         prompt = line.get("text", line.get("prompt", ""))
         response = line.get("response_label", None)
         label = normalize_safety(line.get("prompt_label", "safe"))
         cat = normalize_category(line.get("violated_categories", None))
-
         records.append(make_record(
             prompt=prompt,
             response=response,
@@ -252,9 +218,14 @@ def parse_aegis(path: str) -> list[dict]:
     return records
 
 
-def parse_custom(path: str, text_col: str, label_col: str, category_col: str | None,
-                 response_col: str | None, delimiter: str) -> list[dict]:
-    """Generic CSV/TSV/JSONL with configurable column names."""
+def parse_custom(
+    path: str,
+    text_col: str,
+    label_col: str,
+    category_col: str | None,
+    response_col: str | None,
+    delimiter: str,
+) -> list[dict]:
     records = []
     suffix = Path(path).suffix.lower()
 
@@ -276,7 +247,7 @@ def parse_custom(path: str, text_col: str, label_col: str, category_col: str | N
             for row in reader:
                 prompt = row.get(text_col, "")
                 label = normalize_safety(row.get(label_col, "safe"))
-                cat = normalize_category(row.get(category_col, None)) if category_col else "None"
+                cat = normalize_category(row.get(category_col)) if category_col else "None"
                 response = row.get(response_col, None) if response_col else None
                 records.append(make_record(
                     prompt=prompt,
@@ -287,23 +258,15 @@ def parse_custom(path: str, text_col: str, label_col: str, category_col: str | N
     return records
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
 def _iter_jsonl(path: str):
-    """Yield parsed dicts from a JSONL file (or a single JSON array file)."""
     p = Path(path)
-    if p.is_dir():
-        files = sorted(p.glob("*.jsonl")) + sorted(p.glob("*.json"))
-    else:
-        files = [p]
-
+    files = sorted(p.glob("*.jsonl")) + sorted(p.glob("*.json")) if p.is_dir() else [p]
     for f in files:
         with open(f, "r", encoding="utf-8") as fh:
             first_char = fh.read(1)
             fh.seek(0)
             if first_char == "[":
-                data = json.load(fh)
-                yield from data
+                yield from json.load(fh)
             else:
                 for line in fh:
                     line = line.strip()
@@ -312,6 +275,7 @@ def _iter_jsonl(path: str):
 
 
 def write_jsonl(records: list[dict], path: str):
+    """Write records to a JSONL file, creating parent directories as needed."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         for r in records:
@@ -319,7 +283,8 @@ def write_jsonl(records: list[dict], path: str):
     print(f"Wrote {len(records)} records -> {path}")
 
 
-def train_val_split(records: list[dict], ratio: float, seed: int = 42):
+def train_val_split(records: list[dict], ratio: float, seed: int = 42) -> tuple[list[dict], list[dict]]:
+    """Split records into train/val by ratio."""
     rng = random.Random(seed)
     shuffled = records.copy()
     rng.shuffle(shuffled)
@@ -328,7 +293,6 @@ def train_val_split(records: list[dict], ratio: float, seed: int = 42):
 
 
 def print_stats(records: list[dict], name: str = ""):
-    """Print dataset statistics."""
     total = len(records)
     safety_counts = {"safe": 0, "controversial": 0, "unsafe": 0}
     cat_counts: dict[str, int] = {}
@@ -341,19 +305,18 @@ def print_stats(records: list[dict], name: str = ""):
         if len(r["messages"]) > 1:
             has_response += 1
 
-    print(f"\n{'─' * 50}")
+    sep = "─" * 50
+    print(f"\n{sep}")
     print(f"  {name or 'Dataset'}: {total} samples")
     print(f"  With response: {has_response} ({has_response/total*100:.1f}%)")
     print(f"  Query safety:  safe={safety_counts['safe']}  "
           f"controversial={safety_counts['controversial']}  "
           f"unsafe={safety_counts['unsafe']}")
-    print(f"  Categories:")
+    print("  Categories:")
     for cat, cnt in sorted(cat_counts.items(), key=lambda x: -x[1]):
         print(f"    {cat:40s} {cnt:>6d}  ({cnt/total*100:.1f}%)")
-    print(f"{'─' * 50}\n")
+    print(f"{sep}\n")
 
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
 
 PARSERS = {
     "beavertails": parse_beavertails,
@@ -364,6 +327,7 @@ PARSERS = {
 
 
 def main():
+    """CLI entry point."""
     parser = argparse.ArgumentParser(description="Convert safety datasets to Guard JSONL format")
     parser.add_argument("--source", required=True, choices=[*PARSERS.keys(), "custom"])
     parser.add_argument("--input", required=True, help="Input file or directory")
@@ -371,14 +335,11 @@ def main():
     parser.add_argument("--split", type=float, default=None,
                         help="Train ratio (e.g. 0.9). Produces <output> and <output>.val.jsonl")
     parser.add_argument("--seed", type=int, default=42)
-
-    # custom source options
-    parser.add_argument("--text_col", default="text", help="Column name for prompt text")
-    parser.add_argument("--label_col", default="label", help="Column name for safety label")
-    parser.add_argument("--category_col", default=None, help="Column name for category")
-    parser.add_argument("--response_col", default=None, help="Column name for response")
-    parser.add_argument("--delimiter", default=",", help="CSV delimiter")
-
+    parser.add_argument("--text_col", default="text")
+    parser.add_argument("--label_col", default="label")
+    parser.add_argument("--category_col", default=None)
+    parser.add_argument("--response_col", default=None)
+    parser.add_argument("--delimiter", default=",")
     args = parser.parse_args()
 
     if args.source == "custom":

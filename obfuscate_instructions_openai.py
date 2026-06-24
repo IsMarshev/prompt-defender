@@ -29,13 +29,9 @@ from openai import OpenAI
 
 
 SYSTEM_PROMPT = (
-    "Ты преобразуешь пользовательские инструкции в обфусцированный вариант на русском.\n"
-    "Требования:\n"
-    "1) Вывод только на русском языке.\n"
-    "2) Сохрани исходный смысл и намерение инструкции.\n"
-    "3) Сделай формулировку менее прямой: перефраз, эвфемизмы, перестановка структуры.\n"
-    "4) Не добавляй новые факты, шаги, предупреждения или объяснения.\n"
-    "5) Верни только итоговую инструкцию, без кавычек и без служебного текста."
+    "Перефразируй инструкцию по-русски, сохраняя смысл, но делая формулировку менее прямой — "
+    "используй эвфемизмы, меняй структуру предложений. "
+    "Ничего не добавляй от себя. Верни только результат."
 )
 
 
@@ -111,17 +107,17 @@ def obfuscate_instruction(
 
     for attempt in range(1, max_retries + 1):
         try:
-            response = client.responses.create(
+            response = client.chat.completions.create(
                 model=model,
-                input=[
+                messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": text},
                 ],
             )
-            content = (response.output_text or "").strip()
+            content = (response.choices[0].message.content or "").strip()
             if content:
                 return content
-            raise RuntimeError("Model returned empty output_text")
+            raise RuntimeError("empty response")
         except Exception as exc:
             last_error = exc
             if attempt >= max_retries:
@@ -150,7 +146,6 @@ def main() -> int:
     parser.add_argument("--max-retries", type=int, default=5, help="Retries per record on API error")
     parser.add_argument("--retry-delay", type=float, default=1.5, help="Base delay in seconds")
     parser.add_argument("--limit", type=int, default=None, help="Process only first N rows")
-    parser.add_argument("--progress-every", type=int, default=50, help="Progress interval in rows")
     args = parser.parse_args()
 
     api_key = os.getenv("OPENAI_API_KEY")
@@ -166,7 +161,7 @@ def main() -> int:
 
     source_path = parse_path(args.source_field)
     target_path = parse_path(args.target_field)
-    client = OpenAI(base_url='https://bothub.chat/api/v2/openai/v1', api_key=api_key)
+    client = OpenAI(base_url="https://bothub.chat/api/v2/openai/v1", api_key=api_key)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -176,13 +171,11 @@ def main() -> int:
     failed = 0
 
     with input_path.open("r", encoding="utf-8") as inp, output_path.open("w", encoding="utf-8") as out:
-        for line_num, line in tqdm(enumerate(inp, start=1)):
-            if args.limit is not None and total >= args.limit:
-                break
-            raw = line.strip()
-            if not raw:
-                continue
+        lines = [l for l in inp if l.strip()]
+        if args.limit is not None:
+            lines = lines[: args.limit]
 
+        for line_num, raw in enumerate(tqdm(lines), start=1):
             total += 1
             try:
                 row = json.loads(raw)
@@ -201,7 +194,7 @@ def main() -> int:
                 obfuscated = obfuscate_instruction(
                     client=client,
                     text=source_text,
-                    model="gemini-3-flash-preview",
+                    model=args.model,
                     max_retries=args.max_retries,
                     retry_delay=args.retry_delay,
                 )
@@ -213,12 +206,6 @@ def main() -> int:
             except Exception as exc:
                 failed += 1
                 print(f"[line {line_num}] api error: {exc}", file=sys.stderr)
-
-            if total % args.progress_every == 0:
-                print(
-                    f"processed={total} converted={converted} skipped={skipped} failed={failed}",
-                    file=sys.stderr,
-                )
 
     print(
         f"Done: total={total} converted={converted} skipped={skipped} failed={failed} -> {output_path}"
